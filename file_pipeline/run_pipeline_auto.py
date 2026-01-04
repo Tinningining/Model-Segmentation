@@ -73,6 +73,31 @@ def call_stage_block(block_idx: int, step_dir: Path, onnx_dir: Path, kv_dir: Pat
     ]
     run_cmd(cmd)
 
+def call_stage_layer(layer_idx: int, step_dir: Path, onnx_dir: Path, kv_dir: Path):
+    cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / f"stage_block.py"),
+        "--layer_idx", 
+        str(layer_idx),
+        "--onnx_dir",
+        str(onnx_dir),
+        "--hidden_in",
+        str(step_dir / f"hidden_block{layer_idx}.npy"),
+        "--hidden_out",
+        str(step_dir / f"hidden_block{layer_idx + 1}.npy"),
+        "--attention_mask",
+        str(step_dir / "attention_mask.npy"),
+        "--position_ids",
+        str(step_dir / "position_ids.npy"),
+        "--past_key",
+        str(kv_dir / f"past_key_block{layer_idx}.npy"),
+        "--past_value",
+        str(kv_dir / f"past_value_block{layer_idx}.npy"),
+        "--meta",
+        str(step_dir / "meta.json"),
+    ]
+    run_cmd(cmd)
+
 
 def call_stage_output(step_dir: Path, onnx_dir: Path, tokenizer_dir: Path,
                       logits_path: Path, tokens_file: Path,
@@ -85,7 +110,7 @@ def call_stage_output(step_dir: Path, onnx_dir: Path, tokenizer_dir: Path,
         "--tokenizer_dir",
         str(tokenizer_dir),
         "--hidden_in",
-        str(step_dir / "hidden_block4.npy"),
+        str(step_dir / "hidden_block28.npy"),
         "--logits",
         str(logits_path),
         "--next_token_file",
@@ -120,18 +145,18 @@ def parse_args():
         default="../onnx_models",
         help="Fallback ONNX dir if --prefill_onnx_dir/--decode_onnx_dir are not provided.",
     )
-    parser.add_argument(
-        "--prefill_onnx_dir",
-        type=str,
-        default=None,
-        help="ONNX directory used for the initial prefill step (embed + blocks + output).",
-    )
-    parser.add_argument(
-        "--decode_onnx_dir",
-        type=str,
-        default=None,
-        help="ONNX directory used for subsequent decode steps; defaults to prefill_onnx_dir if omitted.",
-    )
+    # parser.add_argument(
+    #     "--prefill_onnx_dir",
+    #     type=str,
+    #     default=None,
+    #     help="ONNX directory used for the initial prefill step (embed + blocks + output).",
+    # )
+    # parser.add_argument(
+    #     "--decode_onnx_dir",
+    #     type=str,
+    #     default=None,
+    #     help="ONNX directory used for subsequent decode steps; defaults to prefill_onnx_dir if omitted.",
+    # )
     parser.add_argument("--tokenizer_dir", type=str, default="../models/tokenizer")
     parser.add_argument("--run_root", type=str, default="./runs_auto")
     parser.add_argument("--kv_dir", type=str, default="./kv_cache")
@@ -149,9 +174,9 @@ def parse_args():
 def main():
     args = parse_args()
     prompt_path = Path(args.prompt)
-    base_onnx_dir = Path(args.onnx_dir)
-    prefill_onnx_dir = Path(args.prefill_onnx_dir) if args.prefill_onnx_dir else base_onnx_dir
-    decode_onnx_dir = Path(args.decode_onnx_dir) if args.decode_onnx_dir else prefill_onnx_dir
+    onnx_dir = Path(args.onnx_dir)
+    # prefill_onnx_dir = Path(args.prefill_onnx_dir) if args.prefill_onnx_dir else base_onnx_dir
+    # decode_onnx_dir = Path(args.decode_onnx_dir) if args.decode_onnx_dir else prefill_onnx_dir
     tokenizer_dir = Path(args.tokenizer_dir)
     run_root = Path(args.run_root)
     kv_dir = Path(args.kv_dir)
@@ -176,7 +201,7 @@ def main():
 
         # Choose ONNX directory for this step: prefill for idx==0, decode for later steps.
         # step_onnx_dir = prefill_onnx_dir if idx == 0 else decode_onnx_dir
-        step_onnx_dir = prefill_onnx_dir
+        step_onnx_dir = onnx_dir
 
         if idx == 0:
             call_stage_token_embed(
@@ -205,8 +230,11 @@ def main():
                 max_input_len=args.max_input_len,
             )
 
-        for block_idx in range(4):
-            call_stage_block(block_idx, step_dir, step_onnx_dir, kv_dir)
+        # for block_idx in range(4):
+        #     call_stage_block(block_idx, step_dir, step_onnx_dir, kv_dir)
+
+        for layer_idx in range(28):
+            call_stage_layer(layer_idx, step_dir, step_onnx_dir, kv_dir)
 
         logits_path = step_dir / "logits.npy"
         next_token_id, token_text = call_stage_output(

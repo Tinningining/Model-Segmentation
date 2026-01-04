@@ -148,25 +148,158 @@ class CustomQwen3Attention(nn.Module):
         return attn_output, new_key, new_value
 
 
+# class CustomQwen3DecoderLayer(nn.Module):
+#     def __init__(self, config: Qwen3Config, layer_idx: int):
+#         super().__init__()
+#         self.self_attn = CustomQwen3Attention(config, layer_idx)
+#         self.mlp = CustomQwen3MLP(config)
+#         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+#         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         cos: torch.Tensor,
+#         sin: torch.Tensor,
+#         attention_mask: torch.Tensor,
+#         past_key: Optional[torch.Tensor],
+#         past_value: Optional[torch.Tensor],
+#     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         residual = hidden_states
+#         hidden_states = self.input_layernorm(hidden_states)
+#         attn_output, present_key, present_value = self.self_attn(
+#             hidden_states,
+#             cos,
+#             sin,
+#             attention_mask,
+#             past_key,
+#             past_value,
+#         )
+#         hidden_states = residual + attn_output
+
+#         residual = hidden_states
+#         hidden_states = self.post_attention_layernorm(hidden_states)
+#         hidden_states = self.mlp(hidden_states)
+#         hidden_states = residual + hidden_states
+
+#         return hidden_states, present_key, present_value
+
+
+# class Qwen3BlockStackModule(nn.Module):
+#     """Consecutive decoder layers exported together (supports KV cache IO)."""
+
+#     def __init__(self, base_model: "Qwen3ForCausalLM", start_layer: int, end_layer: int):
+#         super().__init__()
+#         config = base_model.config
+#         self.config = config
+#         self.start_layer = start_layer
+#         self.end_layer = end_layer
+#         self.rotary_emb = base_model.model.rotary_emb
+
+#         self.layers = nn.ModuleList()
+#         for idx in range(start_layer, end_layer):
+#             custom_layer = CustomQwen3DecoderLayer(config, idx)
+#             custom_layer.load_state_dict(base_model.model.layers[idx].state_dict())
+#             self.layers.append(custom_layer)
+
+#     def forward(
+#         self,
+#         hidden_states: torch.Tensor,
+#         attention_mask: torch.Tensor,
+#         position_ids: torch.Tensor,
+#         past_key: Optional[torch.Tensor] = None,
+#         past_value: Optional[torch.Tensor] = None,
+#     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         bsz, seq_len, _ = hidden_states.shape
+#         position_ids = position_ids.to(torch.long)
+#         cos, sin = self.rotary_emb(hidden_states, position_ids)
+#         cos = cos.to(hidden_states.dtype)
+#         sin = sin.to(hidden_states.dtype)
+
+#         present_keys = []
+#         present_values = []
+
+#         for layer_idx, layer in enumerate(self.layers):
+#             layer_past_k = None
+#             layer_past_v = None
+#             if past_key is not None and past_key.shape[0] > layer_idx:
+#                 layer_past_k = past_key[layer_idx]
+#             if past_value is not None and past_value.shape[0] > layer_idx:
+#                 layer_past_v = past_value[layer_idx]
+#             if layer_past_k is not None and layer_past_k.shape[2] == 0:
+#                 layer_past_k = None
+#             if layer_past_v is not None and layer_past_v.shape[2] == 0:
+#                 layer_past_v = None
+
+#             hidden_states, pk, pv = layer(
+#                 hidden_states,
+#                 cos,
+#                 sin,
+#                 attention_mask,
+#                 layer_past_k,
+#                 layer_past_v,
+#             )
+#             present_keys.append(pk)
+#             present_values.append(pv)
+
+#         present_key = torch.stack(present_keys, dim=0)
+#         present_value = torch.stack(present_values, dim=0)
+#         return hidden_states, present_key, present_value
+
 class CustomQwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    """
+    Single Qwen3 decoder layer with rotary embedding and KV cache.
+    Forward signature matches Qwen3BlockStackModule.
+    """
+
+    def __init__(self, base_model: "Qwen3ForCausalLM", layer_idx: int):
         super().__init__()
+        config = base_model.config
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.rotary_emb = base_model.model.rotary_emb
+
         self.self_attn = CustomQwen3Attention(config, layer_idx)
         self.mlp = CustomQwen3MLP(config)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = Qwen3RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        # load weights
+        self.load_state_dict(
+            base_model.model.layers[layer_idx].state_dict(),
+            strict=False,
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
         attention_mask: torch.Tensor,
-        past_key: Optional[torch.Tensor],
-        past_value: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+        past_key: Optional[torch.Tensor] = None,
+        past_value: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        # ---- rotary embedding ----
+        position_ids = position_ids.to(torch.long)
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        cos = cos.to(hidden_states.dtype)
+        sin = sin.to(hidden_states.dtype)
+
+        # ---- empty KV → None (ONNX-friendly) ----
+        if past_key is not None and past_key.shape[2] == 0:
+            past_key = None
+        if past_value is not None and past_value.shape[2] == 0:
+            past_value = None
+
+        # ---- attention + residual ----
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+
         attn_output, present_key, present_value = self.self_attn(
             hidden_states,
             cos,
@@ -177,6 +310,7 @@ class CustomQwen3DecoderLayer(nn.Module):
         )
         hidden_states = residual + attn_output
 
+        # ---- MLP + residual ----
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
@@ -184,67 +318,6 @@ class CustomQwen3DecoderLayer(nn.Module):
 
         return hidden_states, present_key, present_value
 
-
-class Qwen3BlockStackModule(nn.Module):
-    """Consecutive decoder layers exported together (supports KV cache IO)."""
-
-    def __init__(self, base_model: "Qwen3ForCausalLM", start_layer: int, end_layer: int):
-        super().__init__()
-        config = base_model.config
-        self.config = config
-        self.start_layer = start_layer
-        self.end_layer = end_layer
-        self.rotary_emb = base_model.model.rotary_emb
-
-        self.layers = nn.ModuleList()
-        for idx in range(start_layer, end_layer):
-            custom_layer = CustomQwen3DecoderLayer(config, idx)
-            custom_layer.load_state_dict(base_model.model.layers[idx].state_dict())
-            self.layers.append(custom_layer)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        past_key: Optional[torch.Tensor] = None,
-        past_value: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bsz, seq_len, _ = hidden_states.shape
-        position_ids = position_ids.to(torch.long)
-        cos, sin = self.rotary_emb(hidden_states, position_ids)
-        cos = cos.to(hidden_states.dtype)
-        sin = sin.to(hidden_states.dtype)
-
-        present_keys = []
-        present_values = []
-
-        for layer_idx, layer in enumerate(self.layers):
-            layer_past_k = None
-            layer_past_v = None
-            if past_key is not None and past_key.shape[0] > layer_idx:
-                layer_past_k = past_key[layer_idx]
-            if past_value is not None and past_value.shape[0] > layer_idx:
-                layer_past_v = past_value[layer_idx]
-            if layer_past_k is not None and layer_past_k.shape[2] == 0:
-                layer_past_k = None
-            if layer_past_v is not None and layer_past_v.shape[2] == 0:
-                layer_past_v = None
-
-            hidden_states, pk, pv = layer(
-                hidden_states,
-                cos,
-                sin,
-                attention_mask,
-                layer_past_k,
-                layer_past_v,
-            )
-            present_keys.append(pk)
-            present_values.append(pv)
-
-        present_key = torch.stack(present_keys, dim=0)
-        present_value = torch.stack(present_values, dim=0)
-        return hidden_states, present_key, present_value
 
 
 class Qwen3OutputModule(nn.Module):
