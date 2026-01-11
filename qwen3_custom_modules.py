@@ -38,16 +38,6 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-# class Qwen3EmbeddingModule(nn.Module):
-#     """Token embedding module shared by all blocks."""
-
-#     def __init__(self, base_model: "Qwen3ForCausalLM"):
-#         super().__init__()
-#         self.embed_tokens = base_model.model.embed_tokens
-
-#     def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
-#         return self.embed_tokens(input_ids)
-
 class Qwen3EmbeddingModule(nn.Module):
     """Token embedding module shared by all blocks."""
 
@@ -55,10 +45,20 @@ class Qwen3EmbeddingModule(nn.Module):
         super().__init__()
         self.embed_tokens = base_model.model.embed_tokens
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # 强制转换为 long，因为 embed_tokens 需要 long
-        input_ids = input_ids.to(torch.long)
+    def forward(self, input_ids: torch.LongTensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
+
+# class Qwen3EmbeddingModule(nn.Module):
+#     """Token embedding module shared by all blocks."""
+
+#     def __init__(self, base_model: "Qwen3ForCausalLM"):
+#         super().__init__()
+#         self.embed_tokens = base_model.model.embed_tokens
+
+#     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         # 强制转换为 long，因为 embed_tokens 需要 long
+#         input_ids = input_ids.to(torch.long)
+#         return self.embed_tokens(input_ids)
     
 
 class CustomQwen3MLP(nn.Module):
@@ -285,7 +285,7 @@ class CustomQwen3DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         # ---- rotary embedding ----
-        position_ids = position_ids.to(torch.long)
+        # position_ids = position_ids.to(torch.long)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         cos = cos.to(hidden_states.dtype)
         sin = sin.to(hidden_states.dtype)

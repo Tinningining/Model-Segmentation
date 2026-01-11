@@ -59,7 +59,8 @@ def run_layer(args: argparse.Namespace):
     feeds = {
         "hidden_states": hidden,
         "attention_mask": attn,
-        "position_ids": pos.astype(np.float32, copy=False),
+        # "position_ids": pos.astype(np.float32, copy=False),
+        "position_ids": pos,
         "past_key": past_key[0].astype(np.float32, copy=False),
         "past_value": past_value[0].astype(np.float32, copy=False),
     }

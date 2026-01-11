@@ -27,8 +27,8 @@ def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 8):
 
     # 1) Embedding
     emb = Qwen3EmbeddingModule(base).eval()
-    # ids = torch.zeros(1, seq_len, dtype=torch.long)
-    ids = torch.zeros(1, seq_len, dtype=torch.float32)
+    ids = torch.zeros(1, seq_len, dtype=torch.long)
+    # ids = torch.zeros(1, seq_len, dtype=torch.float32)
     torch.onnx.export(
         emb,
         (ids,),
@@ -97,7 +97,8 @@ def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 8):
 
         hs = torch.zeros(1, seq_len, base.config.hidden_size)
         attn = torch.zeros(1, 1, seq_len, seq_len * 2)
-        pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0)
+        # pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0)
+        pos = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
         past_shape = (1, kv_heads, seq_len, head_dim)
         past_key = torch.zeros(past_shape)
         past_value = torch.zeros(past_shape)

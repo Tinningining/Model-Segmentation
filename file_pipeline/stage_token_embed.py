@@ -106,7 +106,8 @@ def main():
     save_array(output_dir / "tokens.npy", tokens)
 
     embed_session = ort.InferenceSession(str(Path(args.onnx_dir) / "embed.onnx"), providers=["CPUExecutionProvider"])
-    embed_ids = np.full((1, max_input_len), pad_id, dtype=np.float32)
+    # embed_ids = np.full((1, max_input_len), pad_id, dtype=np.float32)
+    embed_ids = np.full((1, max_input_len), pad_id, dtype=np.long)
     embed_ids[:, :q_len] = tokens
     hidden = embed_session.run(None, {"input_ids": embed_ids})[0].astype(np.float32)
     save_array(output_dir / "hidden_block0.npy", hidden)
