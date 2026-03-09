@@ -120,18 +120,18 @@ def parse_args():
         default="../onnx_models",
         help="Fallback ONNX dir if --prefill_onnx_dir/--decode_onnx_dir are not provided.",
     )
-    parser.add_argument(
-        "--prefill_onnx_dir",
-        type=str,
-        default=None,
-        help="ONNX directory used for the initial prefill step (embed + blocks + output).",
-    )
-    parser.add_argument(
-        "--decode_onnx_dir",
-        type=str,
-        default=None,
-        help="ONNX directory used for subsequent decode steps; defaults to prefill_onnx_dir if omitted.",
-    )
+    # parser.add_argument(
+    #     "--prefill_onnx_dir",
+    #     type=str,
+    #     default=None,
+    #     help="ONNX directory used for the initial prefill step (embed + blocks + output).",
+    # )
+    # parser.add_argument(
+    #     "--decode_onnx_dir",
+    #     type=str,
+    #     default=None,
+    #     help="ONNX directory used for subsequent decode steps; defaults to prefill_onnx_dir if omitted.",
+    # )
     parser.add_argument("--tokenizer_dir", type=str, default="../models/tokenizer")
     parser.add_argument("--run_root", type=str, default="./runs_auto")
     parser.add_argument("--kv_dir", type=str, default="./kv_cache")
@@ -149,9 +149,9 @@ def parse_args():
 def main():
     args = parse_args()
     prompt_path = Path(args.prompt)
-    base_onnx_dir = Path(args.onnx_dir)
-    prefill_onnx_dir = Path(args.prefill_onnx_dir) if args.prefill_onnx_dir else base_onnx_dir
-    decode_onnx_dir = Path(args.decode_onnx_dir) if args.decode_onnx_dir else prefill_onnx_dir
+    onnx_dir = Path(args.onnx_dir)
+    # prefill_onnx_dir = Path(args.prefill_onnx_dir) if args.prefill_onnx_dir else base_onnx_dir
+    # decode_onnx_dir = Path(args.decode_onnx_dir) if args.decode_onnx_dir else prefill_onnx_dir
     tokenizer_dir = Path(args.tokenizer_dir)
     run_root = Path(args.run_root)
     kv_dir = Path(args.kv_dir)
@@ -176,7 +176,7 @@ def main():
 
         # Choose ONNX directory for this step: prefill for idx==0, decode for later steps.
         # step_onnx_dir = prefill_onnx_dir if idx == 0 else decode_onnx_dir
-        step_onnx_dir = prefill_onnx_dir
+        step_onnx_dir = onnx_dir
 
         if idx == 0:
             call_stage_token_embed(
