@@ -1,0 +1,5 @@
+[2026-01-20 23:17:42] Predict Start. Text: <|user|>
+hello</s>
+<|assistant|>
+  Shape: (1, 16), Dtype: int64, Min: 2, Max: 29989, Mean: 17303.6875, Sum: 276859.0000
+  Data (flat[:10]): [  529 29989  1792 29989 29958    13 12199     2 29871    13]
