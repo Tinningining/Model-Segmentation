@@ -439,20 +439,38 @@ scp layers_14_20.om config.json orangepi@192.168.137.102:~/qwen_distributed/mode
 scp layers_21_27.om output.om config.json orangepi@192.168.137.103:~/qwen_distributed/models/
 ```
 
-### 步骤 4：准备输入文件
+### 步骤 4：准备 tokenizer 和输入文本文件
 
-在香橙派 1 (Node 0) 上创建输入 token 文件：
+#### 4.1 复制 tokenizer 文件到头节点
+
+```bash
+# 将完整的 tokenizer 目录复制到香橙派 1 (Node 0)
+# 需要包含 tokenizer_config.json, special_tokens_map.json 等文件
+scp -r D:\qwen_split\qwen3_1.7b orangepi@192.168.137.100:~/qwen_distributed/tokenizer/
+```
+
+#### 4.2 安装 transformers 库
 
 ```bash
 # SSH 到香橙派 1 (Node 0)
 ssh orangepi@192.168.137.100
 
-# 创建输入 token 文件
-cd ~/qwen_distributed/code
-echo "151644 8948 198 2610 525 264 10950 17847 13" > init_tokens.txt
+# 安装 transformers 和 sentencepiece
+pip3 install transformers sentencepiece
 ```
 
-> **说明**：这些 token ID 对应 Qwen 的 tokenizer 编码结果。你可以使用 transformers 库预先编码你的 prompt。
+#### 4.3 准备输入文本文件
+
+```bash
+# SSH 到香橙派 1 (Node 0)
+ssh orangepi@192.168.137.100
+
+# 创建输入文本文件
+cd ~/qwen_distributed/code
+echo "介绍一下大模型的基本工作原理" > input.txt
+```
+
+> **说明**：程序会自动读取文本文件内容，并使用 tokenizer 将文本编码为 token 后进行推理。
 
 ### 步骤 5：启动分布式推理
 
@@ -613,10 +631,11 @@ cd ~/qwen_distributed/code
 # 启动头节点
 python3 node_head.py \
     --om_dir ~/qwen_distributed/models \
+    --tokenizer_dir ~/qwen_distributed/tokenizer \
     --device 0 \
     --max_cache_len 1024 \
     --max_input_len 16 \
-    --init_tokens init_tokens.txt \
+    --input_file input.txt \
     --max_new_tokens 100 \
     --listen_port 9000 \
     --next_ip 192.168.137.101 \
@@ -626,15 +645,21 @@ python3 node_head.py \
 
 启动后，你应该看到推理开始运行：
 ```
+[Input] Reading text from file: input.txt
+[Input] Text content: 介绍一下大模型的基本工作原理
+[Input] Encoded to 12 tokens: [151644, 108386, 3837, 99489, ...]
 [Node0-Head] Initializing...
 [Node0-Head] Loading models...
+[Node0-Head] Loading tokenizer from: ~/qwen_distributed/tokenizer
 [ACLModel] Loaded: .../embed.om
 [ACLModel] Loaded: .../layers_0_6.om
 [Node0-Head] KV Cache initialized for 7 layers
 [Node0-Head] Waiting for tail node connection...
 [Node0-Head] Initialization complete!
 [Node0-Head] Step 0: generated token 12345
+[Node0-Head] Step 0: generated text '大模型'
 [Node0-Head] Step 1: generated token 67890
+[Node0-Head] Step 1: generated text '是'
 ...
 ```
 
@@ -647,6 +672,7 @@ python3 node_head.py \
 Generated 100 tokens in 15.23s
 Speed: 6.57 tokens/s
 Generated IDs: [12345, 67890, ...]
+Generated text: 你好，请问有什么可以帮助你的？
 ```
 
 > **注意**：4 节点版本由于模型常驻内存，推理速度比 2 节点版本快很多。
@@ -667,11 +693,12 @@ python3 node_head.py \
     --device 0 \
     --max_cache_len 1024 \
     --max_input_len 16 \
-    --init_tokens init_tokens.txt \
+    --input_file input.txt \
     --max_new_tokens 100 \
     --listen_port 9000 \
     --next_ip 192.168.137.101 \
     --next_port 9001 \
+    --tokenizer_dir ~/qwen_distributed/tokenizer \
     --greedy
 ```
 
@@ -737,11 +764,12 @@ python3 node_head.py \
     --device 0 \
     --max_cache_len 1024 \
     --max_input_len 16 \
-    --init_tokens init_tokens.txt \
+    --input_file input.txt \
     --max_new_tokens 100 \
     --listen_port 9000 \
     --next_ip 192.168.137.101 \
     --next_port 9001 \
+    --tokenizer_dir ~/qwen_distributed/tokenizer \
     --greedy
 EOF
 
@@ -799,11 +827,12 @@ python3 node_head.py \\
     --device 0 \\
     --max_cache_len 1024 \\
     --max_input_len 16 \\
-    --init_tokens init_tokens.txt \\
+    --input_file input.txt \\
     --max_new_tokens 100 \\
     --listen_port 9000 \\
     --next_ip 192.168.137.101 \\
     --next_port 9001 \\
+    --tokenizer_dir ~/qwen_distributed/tokenizer \\
     --greedy
 EOF
 chmod +x $REMOTE_DIR/code/start.sh"
@@ -902,7 +931,7 @@ config = DistributedConfig4Nodes(
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--init_tokens` | 初始 token 文件 | 必填 |
+| `--input_file` | 输入文本文件路径，程序会读取文件内容并自动编码成 token | 必填 |
 | `--max_new_tokens` | 最大生成 token 数 | 100 |
 | `--temperature` | 采样温度 | 1.0 |
 | `--top_k` | Top-K 采样 | 0 |
@@ -911,6 +940,7 @@ config = DistributedConfig4Nodes(
 | `--listen_port` | 监听端口 | 9000 |
 | `--next_ip` | 下一节点 IP | 192.168.137.101 |
 | `--next_port` | 下一节点端口 | 9001 |
+| `--tokenizer_dir` | tokenizer 目录，用于文本编码和生成结果解码 | `D:\qwen_split\qwen3_1.7b` |
 
 #### 中间节点 (Node 1, 2) 特有参数
 
@@ -1065,8 +1095,23 @@ node.shutdown()
 
 - Python 3.8+
 - NumPy
+- tokenizers（用于文本编码/解码，需提供 `tokenizer.json` 文件）
 - 华为昇腾 ACL SDK（pyACL）
 - 香橙派昇腾开发板 × 4
+
+### 安装 tokenizers
+
+```bash
+# 在线安装
+pip install tokenizers
+
+# 或离线安装（适用于香橙派）
+# 在有网络的电脑上下载
+pip download tokenizers --dest ./offline_pkgs --platform manylinux2014_aarch64 --only-binary=:all:
+
+# 然后复制到香橙派并安装
+pip install ./offline_pkgs/tokenizers-*.whl
+```
 
 ---
 

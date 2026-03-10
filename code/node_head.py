@@ -13,8 +13,9 @@ from network import NodeServer, NodeClient, DistributedMessage
 from acl_model import ACLModel
 from kvcache import create_kvcache
 from utils import (
-    build_attention_mask, build_position_ids, 
-    pad_input_ids, reshape_hidden_output
+    build_attention_mask, build_position_ids,
+    decode_incremental_text, decode_token_ids,
+    encode_text, load_tokenizer, pad_input_ids, reshape_hidden_output
 )
 
 
@@ -36,6 +37,9 @@ class HeadNode4Nodes:
         # KV Cache
         self.kv_cache = None
         
+        # tokenizer（仅用于本地文本解码）
+        self.tokenizer = None
+        
         # 状态
         self.past_len = 0
         self.step = 0
@@ -54,7 +58,12 @@ class HeadNode4Nodes:
         self.block_model = ACLModel(model_paths[1], self.config.device_id)
         self.block_model.init()
         
-        # 2. 初始化 KV Cache
+        # 2. 加载 tokenizer（仅头节点需要）
+        if self.config.tokenizer_dir:
+            print(f"[{self.node_name}] Loading tokenizer from: {self.config.tokenizer_dir}")
+            self.tokenizer = load_tokenizer(self.config.tokenizer_dir)
+        
+        # 3. 初始化 KV Cache
         num_layers = self.config.get_num_layers()  # 7 层
         
         self.kv_cache = create_kvcache(
@@ -66,18 +75,18 @@ class HeadNode4Nodes:
         )
         print(f"[{self.node_name}] KV Cache initialized for {num_layers} layers")
         
-        # 3. 启动服务器（接收尾节点返回的结果）
+        # 4. 启动服务器（接收尾节点返回的结果）
         listen_port = self.config.get_listen_port()
         self.server = NodeServer(listen_port, self.node_name)
         self.server.start()
         
-        # 4. 连接到下一个节点
+        # 5. 连接到下一个节点
         next_addr = self.config.get_next_node_address()
         if next_addr:
             self.client = NodeClient(next_addr["ip"], next_addr["port"], self.node_name)
             self.client.connect()
         
-        # 5. 等待尾节点连接
+        # 6. 等待尾节点连接
         print(f"[{self.node_name}] Waiting for tail node connection...")
         self.server.accept_connection()
         
@@ -151,6 +160,7 @@ class HeadNode4Nodes:
     def generate(self, prompt_ids: np.ndarray, max_new_tokens: int = 100) -> list:
         """生成文本"""
         generated_ids = []
+        decoded_text = ""
         self.past_len = 0
         self.step = 0
         current_ids = prompt_ids
@@ -201,6 +211,16 @@ class HeadNode4Nodes:
                 generated_ids.append(next_token)
                 print(f"[{self.node_name}] Step {self.step}: generated token {next_token}")
                 
+                if self.tokenizer is not None:
+                    delta_text, decoded_text = decode_incremental_text(
+                        self.tokenizer,
+                        generated_ids,
+                        previous_text=decoded_text,
+                        skip_special_tokens=True
+                    )
+                    if delta_text:
+                        print(f"[{self.node_name}] Step {self.step}: generated text {delta_text!r}")
+                
                 self.past_len += q_len
                 self.step += 1
                 current_ids = np.array([[next_token]], dtype=np.int64)
@@ -242,7 +262,7 @@ def main():
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
     parser.add_argument("--max_input_len", type=int, default=16)
-    parser.add_argument("--init_tokens", type=str, required=True, help="Initial token file")
+    parser.add_argument("--input_file", type=str, required=True, help="Input text file")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
@@ -251,11 +271,18 @@ def main():
     parser.add_argument("--listen_port", type=int, default=9000)
     parser.add_argument("--next_ip", type=str, default="192.168.137.101")
     parser.add_argument("--next_port", type=int, default=9001)
+    parser.add_argument(
+        "--tokenizer_dir",
+        type=str,
+        default=r"D:\qwen_split\qwen3_1.7b",
+        help="Tokenizer directory for encoding/decoding text",
+    )
     
     args = parser.parse_args()
     
     config = DistributedConfig4Nodes(
         om_dir=args.om_dir,
+        tokenizer_dir=args.tokenizer_dir,
         device_id=args.device,
         max_cache_len=args.max_cache_len,
         max_input_len=args.max_input_len,
@@ -270,24 +297,45 @@ def main():
     config.node_addresses[1]["ip"] = args.next_ip
     config.node_addresses[1]["port"] = args.next_port
     
-    with open(args.init_tokens, "r") as f:
-        text = f.read().strip()
-        prompt_ids = [int(x) for x in text.replace("\n", " ").split()]
+    node = HeadNode4Nodes(config)
+    node.init()
+    
+    # 从文本文件读取输入
+    print(f"[Input] Reading text from file: {args.input_file}")
+    with open(args.input_file, "r", encoding="utf-8") as f:
+        input_text = f.read().strip()
+    
+    if not input_text:
+        raise ValueError(f"Input file is empty: {args.input_file}")
+    
+    print(f"[Input] Text content: {input_text}")
+    
+    if node.tokenizer is None:
+        raise RuntimeError("Tokenizer is required. Please specify --tokenizer_dir")
+    
+    # 将文本编码为 token
+    prompt_ids = encode_text(node.tokenizer, input_text)
+    print(f"[Input] Encoded to {len(prompt_ids)} tokens: {prompt_ids}")
     prompt_ids = np.array([prompt_ids], dtype=np.int64)
     
-    node = HeadNode4Nodes(config)
-    
     try:
-        node.init()
-        
         start_time = time.time()
         generated = node.generate(prompt_ids, args.max_new_tokens)
         elapsed = time.time() - start_time
+        
+        generated_text = ""
+        if node.tokenizer is not None:
+            generated_text = decode_token_ids(
+                node.tokenizer,
+                generated,
+                skip_special_tokens=True
+            )
         
         print(f"\n{'='*50}")
         print(f"Generated {len(generated)} tokens in {elapsed:.2f}s")
         print(f"Speed: {len(generated)/elapsed:.2f} tokens/s")
         print(f"Generated IDs: {generated}")
+        print(f"Generated text: {generated_text}")
         
     finally:
         node.shutdown()

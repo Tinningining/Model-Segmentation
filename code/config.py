@@ -13,6 +13,7 @@ class DistributedConfig4Nodes:
     """4 节点分布式推理配置"""
     # 模型配置
     om_dir: str = ""  # OM 模型目录
+    tokenizer_dir: str = ""  # tokenizer 目录（可指向完整模型目录）
     
     # 模型参数（从 config.json 加载）
     hidden_size: int = 2048
