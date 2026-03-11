@@ -25,9 +25,9 @@ class DistributedConfig2Nodes:
     
     # KV Cache 配置
     max_cache_len: int = 1024  # past_key/past_value 的序列长度
-    max_input_len: int = 16    # 当前输入的最大长度
+    max_input_len: int = 512   # 当前输入的最大长度
     # attention_mask 形状: [1, 1, max_input_len, max_cache_len + max_input_len]
-    # 即 [1, 1, 16, 1040]
+    # 即 [1, 1, 512, 1536]
     
     # 采样配置
     temperature: float = 1.0

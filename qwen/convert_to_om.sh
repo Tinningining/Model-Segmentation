@@ -12,8 +12,8 @@
 # 配置参数
 ONNX_DIR="./onnx_models"
 OM_DIR="./model_om"
-SOC_VERSION="Ascend310B1"  # 根据实际硬件修改
-SEQ_LEN=16                  # 序列长度
+SOC_VERSION="Ascend310B4"  # 根据实际硬件修改
+SEQ_LEN=512                 # 序列长度
 MAX_CACHE_LEN=1024          # KV Cache 最大长度
 
 # Qwen3-1.7B 模型参数

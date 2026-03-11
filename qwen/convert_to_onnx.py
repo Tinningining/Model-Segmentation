@@ -12,7 +12,7 @@ from qwen3_custom_modules import (
 )
 
 
-def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 8):
+def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 512):
     """导出嵌入、7 层一份的 4 个 Block 以及输出头 ONNX。
 
     Block 的输入/输出包含 hidden_states、attention_mask、position_ids 以及
@@ -114,6 +114,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", default="/home/szm/atlas/qwen3_1.7b")
     ap.add_argument("--onnx_dir", default="./onnx_models")
-    ap.add_argument("--seq_len", type=int, default=16)
+    ap.add_argument("--seq_len", type=int, default=512)
     args = ap.parse_args()
     export_onnx(args.model_path, args.onnx_dir, args.seq_len)
