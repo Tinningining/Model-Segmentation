@@ -202,21 +202,23 @@ class DistributedMessage:
 
 ## 2.1 核心设计思路
 
-### 关键洞察
+### 关键洞察（以当前代码实现为准）
 
-1. **工具调用发生在Node 0**
-   - Node 0是唯一与外界交互的节点
-   - 只有Node 0知道完整的生成文本
-   - 工具调用的决策和结果处理都在Node 0
+1. **工具调用决策发生在 Node 0，但工具执行可分布式**
+   - Node 0：流式解析 `<tool_call>`、调度工具、聚合工具结果，并将 `<tool_results>` 注入下一轮推理输入。
+   - Node 1/2/3：各自运行 `ToolAgent`，接收 `MSG_TOOL_CALL` 后在本机执行并返回 `MSG_TOOL_RESULT`。
 
-2. **不破坏现有流水线**
-   - 工具调用是在生成过程中的"暂停"
-   - 工具执行完成后，继续正常的生成流程
-   - 其他节点（1、2、3）无需感知工具调用
+2. **不破坏现有流水线（工具消息复用同一条链路并沿链路转发）**
+   - 推理主链路仍是 `Node 0 → 1 → 2 → 3 → 0`。
+   - `MSG_TOOL_CALL/MSG_TOOL_RESULT` 复用现有 socket，通过中间/尾节点“转发”实现路由到目标设备。
 
-3. **利用现有的消息系统**
-   - 添加新的消息类型：MSG_TOOL_CALL
-   - 工具结果通过文本形式注入到prompt中
+3. **流式并行工具调用**
+   - Node 0 通过 `StreamingToolCallParser` 在增量解码文本时识别完整 `<tool_call>`。
+   - 识别到完整调用后，使用 `AsyncToolExecutor` 并发执行（由 `ToolCoordinator` 决定本地或远程执行）。
+   - 本轮生成结束后统一等待所有 pending 工具完成，再注入 `<tool_results>` 进入下一轮。
+
+4. **KV Cache 管理（关键约束）**
+   - 工具结果注入下一轮之前，Node 0 必须执行 `reset()`：清理本地 KV Cache 并广播 `MSG_RESET` 给所有节点，保证下一轮推理从干净状态开始。
 
 ### 整体架构
 
@@ -251,6 +253,8 @@ class DistributedMessage:
 ```
 
 ## 2.2 工具调用流程
+
+> 当前代码采用“流式解析 + 并行调度 + 分布式执行”的工具调用方式：Node 0 负责识别与调度，Node 1/2/3 负责执行或转发。
 
 ### 完整流程
 
@@ -296,20 +300,17 @@ class DistributedMessage:
 
 ### 关键点
 
-1. **工具调用不影响流水线**
-   - 工具调用发生在Node 0的generate循环中
-   - 其他节点继续正常的process_loop
-   - 工具执行是"旁路"操作
+1. **工具调用与推理流水线共存**
+   - 工具调用的识别与调度发生在 Node 0 的生成循环中。
+   - Node 1/2/3 需要“感知并处理” `MSG_TOOL_CALL/MSG_TOOL_RESULT`：若命中目标设备则执行，否则继续转发到下一跳。
 
-2. **KV Cache管理**
-   - 工具调用后需要重置KV Cache
-   - 使用现有的MSG_RESET消息
-   - 所有节点同步重置
+2. **KV Cache 管理（必须执行）**
+   - 工具结果注入下一轮之前必须重置 KV Cache。
+   - 由 Node 0 调用 `reset()` 广播 `MSG_RESET`，所有节点同步清理各自 KV Cache。
 
-3. **结果传输**
-   - 工具结果以文本形式注入prompt
-   - 不需要特殊的数据传输机制
-   - 利用现有的文本生成流程
+3. **结果回注入**
+   - 工具结果最终仍以文本（如 `<tool_results>...</tool_results>`）形式注入下一轮 prompt，再继续正常流水线推理。
+   - 为避免 tool_result 与 token result 在同一 socket 上互相阻塞/错配，Node 0 端需要对入站消息做缓存/匹配（request_id）。
 
 ## 2.3 消息扩展
 
@@ -323,12 +324,12 @@ class DistributedMessage:
     MSG_RESET = "reset"
     MSG_SHUTDOWN = "shutdown"
     
-    # 新增：工具调用相关（可选，用于调试）
-    MSG_TOOL_CALL = "tool_call"      # 通知工具调用开始
-    MSG_TOOL_RESULT = "tool_result"  # 工具结果返回
+    # 新增：分布式工具调用（当前实现已使用）
+    MSG_TOOL_CALL = "tool_call"        # 工具调用请求（包含 target_device_id 用于路由）
+    MSG_TOOL_RESULT = "tool_result"    # 工具执行结果（包含 request_id 用于匹配）
 ```
 
-**注意**：实际上可能不需要新增消息类型，因为工具调用完全在Node 0内部处理。
+**注意**：当前实现已经依赖 `MSG_TOOL_CALL/MSG_TOOL_RESULT` 完成“工具在任意设备执行”，不再是“完全在 Node 0 内部处理”。
 
 ---
 
@@ -1102,10 +1103,18 @@ logger = logging.getLogger(__name__)
 
 ## 6.2 实现要点
 
-1. **工具调用完全在Node 0处理**
-2. **利用现有的MSG_RESET机制**
-3. **工具结果通过文本注入prompt**
-4. **优先使用Device 0执行工具**
+1. **Node 0 负责识别与调度，工具执行分布式**
+   - Node 0：流式解析 `<tool_call>` + 调度 + 聚合结果 + 注入 `<tool_results>`。
+   - Node 1/2/3：运行 `ToolAgent` 处理 `MSG_TOOL_CALL` 并返回 `MSG_TOOL_RESULT`。
+
+2. **每轮工具调用后必须使用 MSG_RESET 同步清 KV**
+   - Node 0 在注入工具结果前执行 `reset()`，广播 `MSG_RESET`，确保所有节点 KV Cache 一致。
+
+3. **工具结果通过文本注入 prompt 继续下一轮推理**
+   - 工具结果序列化为文本块（例如 `<tool_results>`），由 tokenizer 编码后继续走推理流水线。
+
+4. **调度策略仍优先 Device 0**
+   - 使用 `Device0PreferredScheduler`，在资源允许时优先本地执行以减少跨设备数据传输。
 
 ## 6.3 未来扩展
 

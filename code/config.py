@@ -26,9 +26,9 @@ class DistributedConfig4Nodes:
     
     # KV Cache 配置
     max_cache_len: int = 1024  # past_key/past_value 的序列长度
-    max_input_len: int = 16    # 当前输入的最大长度
+    max_input_len: int = 512    # 当前输入的最大长度
     # attention_mask 形状: [1, 1, max_input_len, max_cache_len + max_input_len]
-    # 即 [1, 1, 16, 1040]
+    # 即 [1, 1, 512, 1536]
     
     # 采样配置
     temperature: float = 1.0
@@ -83,10 +83,60 @@ class DistributedConfig4Nodes:
     bos_token_id: int = 151643
     
     def __post_init__(self):
+        """初始化后验证配置"""
+        self._validate_config()
         if self.om_dir and os.path.isdir(self.om_dir):
             config_path = os.path.join(self.om_dir, "config.json")
             if os.path.exists(config_path):
                 self._load_model_config(config_path)
+    
+    def _validate_config(self):
+        """验证配置参数的合法性"""
+        # 验证节点 ID
+        if not 0 <= self.node_id < self.total_nodes:
+            raise ValueError(f"Invalid node_id: {self.node_id}, must be in range [0, {self.total_nodes})")
+        
+        # 验证设备 ID
+        if self.device_id < 0:
+            raise ValueError(f"Invalid device_id: {self.device_id}, must be >= 0")
+        
+        # 验证 KV Cache 配置
+        if self.max_cache_len <= 0:
+            raise ValueError(f"Invalid max_cache_len: {self.max_cache_len}, must be > 0")
+        if self.max_input_len <= 0 or self.max_input_len > self.max_cache_len:
+            raise ValueError(f"Invalid max_input_len: {self.max_input_len}, must be in (0, {self.max_cache_len}]")
+        
+        # 验证采样参数
+        if self.temperature <= 0:
+            raise ValueError(f"Invalid temperature: {self.temperature}, must be > 0")
+        if self.top_k < 0:
+            raise ValueError(f"Invalid top_k: {self.top_k}, must be >= 0")
+        if not 0 < self.top_p <= 1.0:
+            raise ValueError(f"Invalid top_p: {self.top_p}, must be in (0, 1]")
+        if self.max_gen_len <= 0:
+            raise ValueError(f"Invalid max_gen_len: {self.max_gen_len}, must be > 0")
+        
+        # 验证模型参数
+        if self.hidden_size <= 0:
+            raise ValueError(f"Invalid hidden_size: {self.hidden_size}, must be > 0")
+        if self.num_hidden_layers != 28:
+            raise ValueError(f"Invalid num_hidden_layers: {self.num_hidden_layers}, must be 28 for 4-node setup")
+        if self.num_attention_heads <= 0:
+            raise ValueError(f"Invalid num_attention_heads: {self.num_attention_heads}, must be > 0")
+        if self.num_key_value_heads <= 0 or self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError(f"Invalid num_key_value_heads: {self.num_key_value_heads}")
+        if self.vocab_size <= 0:
+            raise ValueError(f"Invalid vocab_size: {self.vocab_size}, must be > 0")
+        
+        # 验证 OM 目录
+        if self.om_dir and not os.path.isdir(self.om_dir):
+            raise ValueError(f"OM directory does not exist: {self.om_dir}")
+        
+        # 验证节点配置一致性
+        if len(self.node_layers) != self.total_nodes:
+            raise ValueError(f"node_layers must have {self.total_nodes} entries")
+        if sum(self.node_layers.values()) != self.num_hidden_layers:
+            raise ValueError(f"Sum of node_layers ({sum(self.node_layers.values())}) must equal num_hidden_layers ({self.num_hidden_layers})")
     
     def _load_model_config(self, config_path: str):
         """从 config.json 加载模型配置"""

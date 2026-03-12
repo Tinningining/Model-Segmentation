@@ -22,29 +22,60 @@ def send_msg(sock: socket.socket, msg: Any) -> bool:
         # 发送数据
         sock.sendall(data)
         return True
+    except (socket.error, OSError) as e:
+        print(f"[Network] Send socket error: {e}")
+        return False
+    except (pickle.PicklingError, TypeError) as e:
+        print(f"[Network] Send serialization error: {e}")
+        return False
     except Exception as e:
-        print(f"[Network] Send error: {e}")
+        print(f"[Network] Send unexpected error: {e}")
         return False
 
 
-def recv_msg(sock: socket.socket) -> Optional[Any]:
+def recv_msg(sock: socket.socket, timeout: float = None) -> Optional[Any]:
     """
     接收消息
+    
+    Args:
+        sock: socket 对象
+        timeout: 接收超时时间（秒），None 表示无限等待
     """
+    if timeout:
+        sock.settimeout(timeout)
+    
     try:
         # 读取 4 字节长度头
         raw_msglen = _recvall(sock, 4)
         if not raw_msglen:
             return None
         msglen = struct.unpack('>I', raw_msglen)[0]
+        
+        # 验证消息长度合法性（防止恶意数据）
+        if msglen > 100 * 1024 * 1024:  # 100MB 限制
+            print(f"[Network] Recv error: message too large ({msglen} bytes)")
+            return None
+        
         # 读取数据
         data = _recvall(sock, msglen)
         if not data:
             return None
         return pickle.loads(data)
-    except Exception as e:
-        print(f"[Network] Recv error: {e}")
+    except socket.timeout:
+        print(f"[Network] Recv timeout after {timeout}s")
         return None
+    except (socket.error, OSError) as e:
+        print(f"[Network] Recv socket error: {e}")
+        return None
+    except (pickle.UnpicklingError, EOFError) as e:
+        print(f"[Network] Recv deserialization error: {e}")
+        return None
+    except Exception as e:
+        print(f"[Network] Recv unexpected error: {e}")
+        return None
+    finally:
+        if timeout:
+            sock.settimeout(None)  # 恢复阻塞模式
 
 
 def _recvall(sock: socket.socket, n: int) -> Optional[bytes]:
@@ -129,9 +160,16 @@ class NodeClient:
     
     def connect(self, retry_interval: float = 1.0, max_retries: int = 60) -> bool:
         """连接到目标节点"""
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        
         for i in range(max_retries):
+            # 每次重试创建新的 socket（避免资源泄露）
+            if self.sock:
+                try:
+                    self.sock.close()
+                except:
+                    pass
+            
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
             try:
                 self.sock.connect((self.host, self.port))
                 print(f"[{self.node_name}] Connected to {self.host}:{self.port}")
@@ -140,9 +178,20 @@ class NodeClient:
                 if i % 10 == 0:
                     print(f"[{self.node_name}] Waiting for {self.host}:{self.port}...")
                 time.sleep(retry_interval)
-            except Exception as e:
-                print(f"[{self.node_name}] Connect error: {e}")
+            except (socket.error, OSError) as e:
+                print(f"[{self.node_name}] Connect socket error: {e}")
                 time.sleep(retry_interval)
+            except Exception as e:
+                print(f"[{self.node_name}] Connect unexpected error: {e}")
+                time.sleep(retry_interval)
+        
+        # 连接失败，清理 socket
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
         
         print(f"[{self.node_name}] Failed to connect after {max_retries} retries")
         return False
@@ -174,6 +223,8 @@ class DistributedMessage:
     MSG_CONTROL = "control"      # 控制消息
     MSG_RESET = "reset"          # 重置 KV Cache
     MSG_SHUTDOWN = "shutdown"    # 关闭节点
+    MSG_TOOL_CALL = "tool_call"  # 工具调用请求
+    MSG_TOOL_RESULT = "tool_result"  # 工具执行结果
     
     def __init__(
         self,
@@ -248,4 +299,42 @@ class DistributedMessage:
             msg_type=DistributedMessage.MSG_SHUTDOWN,
             step=0,
             data={}
+        )
+    
+    @staticmethod
+    def create_tool_call_msg(
+        tool_name: str,
+        arguments: dict,
+        request_id: str,
+        target_device_id: int
+    ) -> 'DistributedMessage':
+        """创建工具调用请求消息"""
+        return DistributedMessage(
+            msg_type=DistributedMessage.MSG_TOOL_CALL,
+            step=0,
+            data={
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "request_id": request_id,
+                "target_device_id": target_device_id
+            }
+        )
+    
+    @staticmethod
+    def create_tool_result_msg(
+        request_id: str,
+        success: bool,
+        result: Any = None,
+        error: str = None
+    ) -> 'DistributedMessage':
+        """创建工具执行结果消息"""
+        return DistributedMessage(
+            msg_type=DistributedMessage.MSG_TOOL_RESULT,
+            step=0,
+            data={
+                "request_id": request_id,
+                "success": success,
+                "result": result,
+                "error": error
+            }
         )

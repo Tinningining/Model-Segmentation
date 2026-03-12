@@ -13,6 +13,8 @@ from network import NodeServer, NodeClient, DistributedMessage
 from acl_model import ACLModel
 from kvcache import create_kvcache
 from utils import reshape_hidden_output
+from tools import ToolManager, ToolAgent
+from tools.builtin_tools import weather_tool, calculator_tool
 
 
 class MiddleNode4Nodes:
@@ -31,6 +33,10 @@ class MiddleNode4Nodes:
         
         # KV Cache
         self.kv_cache = None
+        
+        # 工具系统
+        self.tool_manager = None
+        self.tool_agent = None
         
         # 状态
         self.past_len = 0
@@ -59,18 +65,21 @@ class MiddleNode4Nodes:
         )
         print(f"[{self.node_name}] KV Cache initialized for {num_layers} layers")
         
-        # 3. 启动服务器（接收上一个节点的数据）
+        # 3. 初始化工具系统
+        self._init_tools()
+        
+        # 4. 启动服务器（接收上一个节点的数据）
         listen_port = self.config.get_listen_port()
         self.server = NodeServer(listen_port, self.node_name)
         self.server.start()
         
-        # 4. 连接到下一个节点
+        # 5. 连接到下一个节点
         next_addr = self.config.get_next_node_address()
         if next_addr:
             self.client = NodeClient(next_addr["ip"], next_addr["port"], self.node_name)
             self.client.connect()
         
-        # 5. 等待上一个节点连接
+        # 6. 等待上一个节点连接
         print(f"[{self.node_name}] Waiting for previous node connection...")
         self.server.accept_connection()
         
@@ -147,6 +156,26 @@ class MiddleNode4Nodes:
                 self.step = msg.step
                 print(f"[{self.node_name}] Step {self.step}: forwarded")
             
+            elif msg.msg_type == DistributedMessage.MSG_TOOL_CALL:
+                # 处理工具调用请求
+                target_device = msg.data.get('target_device_id')
+                
+                if target_device == self.config.device_id:
+                    # 本地执行工具
+                    print(f"[{self.node_name}] Executing tool locally on Device {self.config.device_id}")
+                    result_msg = self.tool_agent.handle_tool_call(msg)
+                    
+                    # 将结果转发到下一个节点（最终会到达尾节点，再返回给头节点）
+                    self.client.send(result_msg.to_dict())
+                    print(f"[{self.node_name}] Tool result forwarded to next node")
+                else:
+                    # 转发到下一个节点
+                    self.client.send(msg.to_dict())
+            
+            elif msg.msg_type == DistributedMessage.MSG_TOOL_RESULT:
+                # 转发工具结果到下一个节点
+                self.client.send(msg.to_dict())
+            
             elif msg.msg_type == DistributedMessage.MSG_RESET:
                 self.reset()
                 # 转发重置消息
@@ -165,8 +194,32 @@ class MiddleNode4Nodes:
         self.step = 0
         self.kv_cache.reset()
     
+    def _init_tools(self):
+        """初始化工具系统"""
+        print(f"[{self.node_name}] Initializing tool system...")
+        
+        # 创建工具管理器
+        devices = [0, 1, 2, 3]
+        self.tool_manager = ToolManager(devices, device_memory_limit=500)
+        
+        # 注册内置工具
+        self.tool_manager.register_tool('get_weather', weather_tool.TOOL_CONFIG)
+        self.tool_manager.register_tool('calculator', calculator_tool.TOOL_CONFIG)
+        
+        # 创建本地工具代理
+        self.tool_agent = ToolAgent(
+            device_id=self.config.device_id,
+            tool_manager=self.tool_manager,
+            node_name=self.node_name
+        )
+        self.tool_agent.start()
+        
+        print(f"[{self.node_name}] Tool agent started on Device {self.config.device_id}")
+    
     def shutdown(self):
         """关闭节点"""
+        if self.tool_agent:
+            self.tool_agent.stop()
         if self.block_model:
             self.block_model.finalize()
         if self.server:
