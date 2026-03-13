@@ -298,6 +298,159 @@ def reshape_logits_output(
     return raw_output.view(np.float32).reshape(batch_size, max_input_len, vocab_size)
 
 
+# ── Qwen Chat Prompt 构建 ──────────────────────────────────────────
+
+def build_chat_prompt(system: str, user: str) -> str:
+    """
+    构建 Qwen 聊天格式的 prompt（im_start/im_end 模板）。
+
+    Args:
+        system: system prompt（含工具描述等）
+        user: 用户消息
+
+    Returns:
+        完整的 prompt 字符串，以 assistant 开头等待模型续写
+    """
+    return (
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{user}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
+    )
+
+
+def build_tool_system_prompt(tools: list) -> str:
+    """
+    根据工具列表构建 system prompt（紧凑格式，节省 token）。
+
+    Args:
+        tools: OpenAI function calling 格式的工具列表
+
+    Returns:
+        system prompt 字符串
+    """
+    # 紧凑格式：每个工具一行
+    lines = []
+    for t in tools:
+        func = t.get("function", {})
+        name = func.get("name", "")
+        desc = func.get("description", "")
+        params = func.get("parameters", {}).get("properties", {})
+        required = func.get("parameters", {}).get("required", [])
+        # 构建参数签名：name*(必填):type 或 name:type=default
+        param_parts = []
+        for pname, pinfo in params.items():
+            ptype = pinfo.get("type", "str")
+            star = "*" if pname in required else ""
+            default = pinfo.get("default")
+            if default is not None and not star:
+                param_parts.append(f'{pname}:{ptype}="{default}"')
+            else:
+                param_parts.append(f"{pname}{star}:{ptype}")
+        sig = ", ".join(param_parts)
+        lines.append(f"- {name}({sig}) — {desc}")
+
+    tool_list = "\n".join(lines)
+    return (
+        f"你是AI助手，可用工具：\n{tool_list}\n\n"
+        f'调用工具时输出JSON：{{"tool_name":"名称","arguments":{{"参数":"值"}}}}\n'
+        f"可一次调用多个，每行一个JSON。不需要工具则直接回答。\n"
+        f"/no_think"
+    )
+
+
+def build_tool_result_prompt(user_message: str,
+                              tool_calls: list,
+                              tool_results: list,
+                              tools: list = None) -> str:
+    """
+    构建工具结果注入后的 system prompt（第二轮推理）。
+
+    Args:
+        user_message: 原始用户问题
+        tool_calls: 工具调用列表 [{"name": ..., "arguments": ...}, ...]
+        tool_results: 工具结果列表 [{"success": ..., "result": ..., "tool_name": ...}, ...]
+        tools: OpenAI 格式工具列表（可选，传入则允许模型继续调用工具）
+
+    Returns:
+        system prompt 字符串
+    """
+    import json
+
+    # 构建工具调用与结果的描述
+    call_descriptions = []
+    for i, (call, result) in enumerate(zip(tool_calls, tool_results)):
+        desc = (
+            f"工具调用{i+1}：{call.get('name', '')}\n"
+            f"  参数：{json.dumps(call.get('arguments', {}), ensure_ascii=False)}\n"
+            f"  返回：{json.dumps(result, ensure_ascii=False)}"
+        )
+        call_descriptions.append(desc)
+
+    calls_text = "\n\n".join(call_descriptions)
+
+    prompt = (
+        f"你是一个AI助手。用户问了一个问题，你调用了工具获取了信息。\n\n"
+        f"用户问题：{user_message}\n\n"
+        f"{calls_text}\n\n"
+    )
+
+    if tools:
+        tool_desc = json.dumps(tools, ensure_ascii=False, indent=2)
+        prompt += (
+            f"你还可以使用以下工具：\n{tool_desc}\n\n"
+            f"如果还需要调用更多工具，请输出JSON格式的工具调用。\n"
+            f"如果信息已经足够，请直接用自然语言回答用户的问题。回答要具体、准确、友好。\n"
+        )
+    else:
+        prompt += f"请基于工具返回的真实数据，用自然语言回答用户的问题。回答要具体、准确、友好。\n"
+
+    prompt += "/no_think"
+    return prompt
+
+
+def build_tools_openai_schema(tool_configs: dict) -> list:
+    """
+    将内部工具配置转换为 OpenAI function calling 格式。
+
+    Args:
+        tool_configs: {tool_name: TOOL_CONFIG, ...}
+
+    Returns:
+        OpenAI 格式的工具列表
+    """
+    tools = []
+    for name, config in tool_configs.items():
+        params = config.get('parameters', {})
+        # 转换为 JSON Schema 格式
+        properties = {}
+        required = []
+        for param_name, param_info in params.items():
+            prop = {"type": param_info.get("type", "string")}
+            if "description" in param_info:
+                prop["description"] = param_info["description"]
+            if "enum" in param_info:
+                prop["enum"] = param_info["enum"]
+            if "default" in param_info:
+                prop["default"] = param_info["default"]
+            properties[param_name] = prop
+            if param_info.get("required", False):
+                required.append(param_name)
+
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": config.get("name", name),
+                "description": config.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                }
+            }
+        })
+    return tools
+
+
 def pad_input_ids(
     input_ids: np.ndarray,
     max_input_len: int,

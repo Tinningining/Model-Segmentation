@@ -255,7 +255,7 @@ def main():
     parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=16)
+    parser.add_argument("--max_input_len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--top_p", type=float, default=1.0)

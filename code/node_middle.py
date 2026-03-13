@@ -234,7 +234,7 @@ def main():
     parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=16)
+    parser.add_argument("--max_input_len", type=int, default=512)
     parser.add_argument("--listen_port", type=int, default=None, help="Listen port (default: 9000 + node_id)")
     parser.add_argument("--next_ip", type=str, default=None, help="Next node IP")
     parser.add_argument("--next_port", type=int, default=None, help="Next node port")

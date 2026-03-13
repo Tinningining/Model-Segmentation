@@ -18,7 +18,9 @@ from kvcache import create_kvcache
 from utils import (
     build_attention_mask, build_position_ids,
     decode_incremental_text, decode_token_ids,
-    encode_text, load_tokenizer, pad_input_ids, reshape_hidden_output
+    encode_text, load_tokenizer, pad_input_ids, reshape_hidden_output,
+    build_chat_prompt, build_tool_system_prompt, build_tool_result_prompt,
+    build_tools_openai_schema,
 )
 from tools import (
     ToolManager,
@@ -28,7 +30,7 @@ from tools import (
     StreamingToolCallParser,
     AsyncToolExecutor,
 )
-from tools.builtin_tools import weather_tool, calculator_tool
+from tools.builtin_tools import weather_tool, calculator_tool, time_tool, unit_converter_tool, translate_tool
 
 
 class HeadNodeWithTools:
@@ -132,6 +134,9 @@ class HeadNodeWithTools:
         # 注册内置工具
         self.tool_manager.register_tool('get_weather', weather_tool.TOOL_CONFIG)
         self.tool_manager.register_tool('calculator', calculator_tool.TOOL_CONFIG)
+        self.tool_manager.register_tool('get_time', time_tool.TOOL_CONFIG)
+        self.tool_manager.register_tool('unit_convert', unit_converter_tool.TOOL_CONFIG)
+        self.tool_manager.register_tool('translate', translate_tool.TOOL_CONFIG)
         
         # 创建调度器
         scheduler = Device0PreferredScheduler(devices, main_device_id=0)
@@ -277,7 +282,7 @@ class HeadNodeWithTools:
     def generate(
         self,
         prompt_ids: np.ndarray,
-        max_new_tokens: int = 100,
+        max_new_tokens: int = 5000,
         max_tool_iterations: int = 5
     ) -> list:
         """
@@ -380,8 +385,23 @@ class HeadNodeWithTools:
                         reached_eos = True
                         break
                 
+                # EOS 后再做一次最终检查：解析器可能在最后几个 token 才凑齐完整 JSON
                 if not has_tool_calls:
-                    # 本轮没有工具调用，直接结束
+                    # 尝试从已有 buffer 中提取（可能最后一个 token 刚好闭合了 JSON）
+                    final_calls = parser.get_all_calls()
+                    if final_calls:
+                        has_tool_calls = True
+                        already_submitted = set(executor.futures.keys())
+                        for tool_call in final_calls:
+                            if tool_call["id"] not in already_submitted:
+                                print(
+                                    f"[{self.node_name}] Late-detected tool_call: "
+                                    f"{tool_call['name']} (id={tool_call['id']})"
+                                )
+                                executor.execute_async(tool_call)
+
+                if not has_tool_calls:
+                    # 本轮确实没有工具调用，直接结束
                     break
                 
                 pending_count = executor.result_buffer.get_pending_count()
@@ -401,9 +421,30 @@ class HeadNodeWithTools:
 
                 # 工具执行完成后必须 reset（清 KV cache + 广播 MSG_RESET）
                 self.reset()
-                
-                tool_prompt = f"\n<tool_results>\n{results_text}\n</tool_results>\n"
+
+                # 构建第二轮推理 prompt：将所有工具结果注入 Qwen chat 模板
+                all_calls = parser.get_all_calls()
+                # 第二轮不再传入工具描述（精简 prompt 长度），直接让模型回答
+                result_system = build_tool_result_prompt(
+                    user_message=getattr(self, '_current_user_message', ''),
+                    tool_calls=all_calls,
+                    tool_results=tool_results,
+                    tools=None,
+                )
+                tool_prompt = build_chat_prompt(
+                    system=result_system,
+                    user=getattr(self, '_current_user_message', ''),
+                )
                 tool_ids = encode_text(self.tokenizer, tool_prompt)
+                
+                # 如果 prompt 超过 max_input_len，从左侧截断（保留最近的上下文）
+                if len(tool_ids) > self.config.max_input_len:
+                    print(
+                        f"[{self.node_name}] Tool prompt too long ({len(tool_ids)} tokens), "
+                        f"truncating to {self.config.max_input_len}"
+                    )
+                    tool_ids = tool_ids[-self.config.max_input_len:]
+                
                 current_ids = np.array([tool_ids], dtype=np.int64)
                 
                 # 若已到 EOS，则依靠工具结果触发下一轮；若未到 EOS，同样进入下一轮
@@ -529,7 +570,7 @@ def main():
     parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=16)
+    parser.add_argument("--max_input_len", type=int, default=512)
     parser.add_argument("--input_file", type=str, required=True, help="Input text file")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -581,9 +622,31 @@ def main():
     if node.tokenizer is None:
         raise RuntimeError("Tokenizer is required. Please specify --tokenizer_dir")
     
-    # 将文本编码为 token
-    prompt_ids = encode_text(node.tokenizer, input_text)
-    print(f"[Input] Encoded to {len(prompt_ids)} tokens: {prompt_ids}")
+    # 构建带工具描述的 Qwen chat prompt
+    # 1) 将内部工具配置转换为 OpenAI function calling 格式
+    tool_configs = {
+        'get_weather': weather_tool.TOOL_CONFIG,
+        'calculator': calculator_tool.TOOL_CONFIG,
+        'get_time': time_tool.TOOL_CONFIG,
+        'unit_convert': unit_converter_tool.TOOL_CONFIG,
+        'translate': translate_tool.TOOL_CONFIG,
+    }
+    openai_tools = build_tools_openai_schema(tool_configs)
+    
+    # 2) 构建 system prompt（含工具描述 + JSON 输出指令）
+    system_prompt = build_tool_system_prompt(openai_tools)
+    
+    # 3) 用 Qwen im_start/im_end 模板包装
+    full_prompt = build_chat_prompt(system=system_prompt, user=input_text)
+    print(f"[Input] Full prompt:\n{full_prompt[:300]}...")
+    
+    # 4) 保存用户消息和工具列表供工具结果注入时使用
+    node._current_user_message = input_text
+    node._openai_tools = openai_tools
+    
+    # 将 prompt 编码为 token
+    prompt_ids = encode_text(node.tokenizer, full_prompt)
+    print(f"[Input] Encoded to {len(prompt_ids)} tokens")
     prompt_ids = np.array([prompt_ids], dtype=np.int64)
     
     try:

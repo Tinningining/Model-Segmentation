@@ -8,10 +8,14 @@ from typing import List, Dict, Any, Optional, Callable
 
 from network import DistributedMessage
 
+THINK_OPEN = "<" + "think>"
+THINK_CLOSE = "</" + "think>"
+THINK_RE = re.compile(THINK_OPEN + r'.*?' + THINK_CLOSE, re.DOTALL)
+
 
 class ToolCoordinator:
     """工具调用协调器 - 支持分布式工具执行"""
-    
+
     def __init__(
         self,
         tool_manager,
@@ -23,138 +27,142 @@ class ToolCoordinator:
         self.scheduler = scheduler
         self.local_device_id = local_device_id
         self.remote_call_handler = remote_call_handler
-    
+
     def parse_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        """从文本中解析工具调用"""
+        """从文本中解析工具调用（JSON 格式）"""
         tool_calls = []
-        
-        # 匹配 <tool_call>...</tool_call>
-        pattern = r'<tool_call>(.*?)</tool_call>'
-        matches = re.findall(pattern, text, re.DOTALL)
-        
-        for match in matches:
-            try:
-                # 提取name和arguments
-                name_match = re.search(r'<name>(.*?)</name>', match)
-                args_match = re.search(r'<arguments>(.*?)</arguments>', match, re.DOTALL)
-                
-                if name_match and args_match:
-                    tool_name = name_match.group(1).strip()
-                    arguments_str = args_match.group(1).strip()
-                    
-                    # 解析JSON参数
-                    try:
-                        arguments = json.loads(arguments_str)
-                    except json.JSONDecodeError:
-                        # 如果不是有效的JSON，尝试简单解析
-                        print(f"[ToolCoordinator] Warning: Invalid JSON arguments for {tool_name}, using raw string")
-                        arguments = {'raw': arguments_str}
-                    
-                    tool_calls.append({
-                        'name': tool_name,
-                        'arguments': arguments
-                    })
-            except Exception as e:
-                print(f"[ToolCoordinator] Failed to parse tool call: {e}")
-        
+
+        # 移除 think 块
+        text_clean = THINK_RE.sub('', text)
+        idx = text_clean.find(THINK_OPEN)
+        if idx != -1:
+            text_clean = text_clean[:idx]
+
+        # 策略1: 从 ```json ... ``` 代码块提取
+        for m in re.finditer(r'```(?:json)?\s*(\{.*?\})\s*```', text_clean, re.DOTALL):
+            call = self._try_parse(m.group(1))
+            if call:
+                tool_calls.append(call)
+
+        if tool_calls:
+            return tool_calls
+
+        # 策略2: 直接提取 JSON 对象
+        for m in re.finditer(r'\{[^{}]*(?:"tool_name"|"name")[^{}]*\}', text_clean):
+            call = self._try_parse(m.group(0))
+            if call:
+                tool_calls.append(call)
+
+        if tool_calls:
+            return tool_calls
+
+        # 策略3: 嵌套 JSON（arguments 内含 {}）
+        start = text_clean.find("{")
+        end = text_clean.rfind("}") + 1
+        if start != -1 and end > start:
+            call = self._try_parse(text_clean[start:end])
+            if call:
+                tool_calls.append(call)
+
         return tool_calls
-    
+
+    def _try_parse(self, text: str) -> Optional[Dict[str, Any]]:
+        """尝试解析单个 JSON 工具调用"""
+        text = text.strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        tool_name = data.get("tool_name") or data.get("name") or ""
+        arguments = data.get("arguments") or data.get("parameters") or {}
+
+        if not tool_name:
+            return None
+
+        return {"name": tool_name, "arguments": arguments}
+
     def execute_tools(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """执行工具调用（支持本地和远程）"""
         results = []
-        
+
         for tool_call in tool_calls:
             tool_name = tool_call['name']
             arguments = tool_call['arguments']
-            
-            # 获取工具信息
+
             tool_info = self.tool_manager.get_tool_info(tool_name)
             if not tool_info:
                 results.append({
                     'success': False,
-                    'error': f"Tool '{tool_name}' not found",
+                    'error': "Tool '%s' not found" % tool_name,
                     'tool_name': tool_name,
                     'device_id': None
                 })
                 continue
-            
-            # 1. 调度到设备
+
             device_id = self.scheduler.schedule(
                 tool_name,
                 tool_size=tool_info['memory_size']
             )
-            
-            print(f"[ToolCoordinator] Executing '{tool_name}' on Device {device_id}")
-            
-            # 2. 判断是本地还是远程执行
+
+            print("[ToolCoordinator] Executing '%s' on Device %d" % (tool_name, device_id))
+
             if device_id == self.local_device_id:
-                # 本地执行
                 result = self._execute_local(tool_name, device_id, arguments)
             else:
-                # 远程执行
                 result = self._execute_remote(tool_name, device_id, arguments)
-            
+
             results.append(result)
-            
+
             if result['success']:
-                print(f"[ToolCoordinator] ✓ Success: {result['result']}")
+                print("[ToolCoordinator] Success: %s" % result['result'])
             else:
-                print(f"[ToolCoordinator] ✗ Error: {result['error']}")
-        
+                print("[ToolCoordinator] Error: %s" % result['error'])
+
         return results
-    
-    def _execute_local(
-        self,
-        tool_name: str,
-        device_id: int,
-        arguments: dict
-    ) -> Dict[str, Any]:
+
+    def _execute_local(self, tool_name, device_id, arguments):
         """在本地设备执行工具"""
-        print(f"[ToolCoordinator] Local execution on Device {device_id}")
+        print("[ToolCoordinator] Local execution on Device %d" % device_id)
         return self.tool_manager.execute_tool(tool_name, device_id, arguments)
-    
-    def _execute_remote(
-        self,
-        tool_name: str,
-        device_id: int,
-        arguments: dict
-    ) -> Dict[str, Any]:
+
+    def _execute_remote(self, tool_name, device_id, arguments):
         """在远程设备执行工具"""
         if self.remote_call_handler is None:
             return {
                 'success': False,
-                'error': f"Remote execution not supported (no handler configured)",
+                'error': "Remote execution not supported (no handler configured)",
                 'tool_name': tool_name,
                 'device_id': device_id
             }
-        
-        print(f"[ToolCoordinator] Remote execution on Device {device_id}")
-        
-        # 生成请求ID
+
+        print("[ToolCoordinator] Remote execution on Device %d" % device_id)
+
         request_id = str(uuid.uuid4())
-        
-        # 创建工具调用消息
+
         tool_call_msg = DistributedMessage.create_tool_call_msg(
             tool_name=tool_name,
             arguments=arguments,
             request_id=request_id,
             target_device_id=device_id
         )
-        
-        # 调用远程处理器
+
         try:
             result_msg = self.remote_call_handler(device_id, tool_call_msg)
-            
+
             if result_msg and result_msg.msg_type == DistributedMessage.MSG_TOOL_RESULT:
                 response_id = result_msg.data.get('request_id')
                 if response_id != request_id:
                     return {
                         'success': False,
-                        'error': f"Request ID mismatch (expected {request_id}, got {response_id})",
+                        'error': "Request ID mismatch",
                         'tool_name': tool_name,
                         'device_id': device_id
                     }
-                
+
                 return {
                     'success': result_msg.data.get('success', False),
                     'result': result_msg.data.get('result'),
@@ -162,7 +170,7 @@ class ToolCoordinator:
                     'tool_name': tool_name,
                     'device_id': device_id
                 }
-            
+
             return {
                 'success': False,
                 'error': 'Invalid response from remote device',
@@ -172,17 +180,23 @@ class ToolCoordinator:
         except Exception as e:
             return {
                 'success': False,
-                'error': f"Remote execution failed: {e}",
+                'error': "Remote execution failed: %s" % str(e),
                 'tool_name': tool_name,
                 'device_id': device_id
             }
-    
+
     def format_tool_results(self, results: List[Dict[str, Any]]) -> str:
-        """格式化工具结果为文本"""
+        """格式化工具结果为 JSON 文本（便于注入 prompt）"""
         formatted = []
         for result in results:
             if result['success']:
-                formatted.append(f"{result['tool_name']}: {result['result']}")
+                formatted.append(json.dumps({
+                    "tool_name": result['tool_name'],
+                    "result": result['result']
+                }, ensure_ascii=False))
             else:
-                formatted.append(f"{result['tool_name']}: Error - {result['error']}")
+                formatted.append(json.dumps({
+                    "tool_name": result['tool_name'],
+                    "error": result['error']
+                }, ensure_ascii=False))
         return "\n".join(formatted)
