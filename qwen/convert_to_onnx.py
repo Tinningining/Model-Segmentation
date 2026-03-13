@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from qwen3_custom_modules import (
     load_base_qwen3,
@@ -12,23 +13,24 @@ from qwen3_custom_modules import (
 )
 
 
-def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 512):
-    """导出嵌入、7 层一份的 4 个 Block 以及输出头 ONNX。
+class Qwen3BlockStackPrefillWrapper(nn.Module):
+    """Prefill 阶段的 Block 包装器：无 past_key/past_value 输入。"""
 
-    Block 的输入/输出包含 hidden_states、attention_mask、position_ids 以及
-    past/present KV，用于后续流水线中的静态 KV cache 推理。
-    """
+    def __init__(self, block_stack: Qwen3BlockStackModule):
+        super().__init__()
+        self.block_stack = block_stack
 
-    onnx_path = Path(onnx_dir)
-    onnx_path.mkdir(parents=True, exist_ok=True)
+    def forward(self, hidden_states, attention_mask, position_ids):
+        return self.block_stack(hidden_states, attention_mask, position_ids)
 
-    base = load_base_qwen3(model_path)
-    cfg_dict = base.config.to_dict()
+
+def export_prefill_onnx(base, onnx_path: Path, prefill_len: int):
+    """导出 Prefill 阶段 ONNX 模型（seq_len=prefill_len，无 past KV）。"""
+    cfg = base.config
 
     # 1) Embedding
     emb = Qwen3EmbeddingModule(base).eval()
-    # ids = torch.zeros(1, seq_len, dtype=torch.long)
-    ids = torch.zeros(1, seq_len, dtype=torch.float32)
+    ids = torch.zeros(1, prefill_len, dtype=torch.float32)
     torch.onnx.export(
         emb,
         (ids,),
@@ -43,22 +45,96 @@ def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 512):
         export_params=True,
     )
 
-    # 2) Blocks (7 layers each)
+    # 2) Blocks（无 past_key/past_value，prefill 首次处理）
     blocks = [
         ("layers_0_6", 0, 7),
         ("layers_7_13", 7, 14),
         ("layers_14_20", 14, 21),
         ("layers_21_27", 21, 28),
     ]
-    kv_heads = base.config.num_key_value_heads
-    head_dim = base.config.hidden_size // base.config.num_attention_heads
     for name, s, e in blocks:
         blk = Qwen3BlockStackModule(base, s, e).eval()
-        hs = torch.zeros(1, seq_len, base.config.hidden_size)
-        attn = torch.zeros(1, 1, seq_len, seq_len * 2)
-        pos = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-        # pos = torch.arange(seq_len, dtype=torch.float32).unsqueeze(0)
-        past_shape = (e - s, 1, kv_heads, seq_len, head_dim)
+        wrapper = Qwen3BlockStackPrefillWrapper(blk).eval()
+        hs = torch.zeros(1, prefill_len, cfg.hidden_size)
+        # Prefill: causal mask，无 past，最后一维 = prefill_len
+        attn = torch.zeros(1, 1, prefill_len, prefill_len)
+        pos = torch.arange(prefill_len, dtype=torch.long).unsqueeze(0)
+        torch.onnx.export(
+            wrapper,
+            (hs, attn, pos),
+            str(onnx_path / f"{name}.onnx"),
+            input_names=["hidden_states", "attention_mask", "position_ids"],
+            output_names=["hidden_states_out", "present_key", "present_value"],
+            dynamic_axes={
+                "hidden_states": {0: "B", 1: "T"},
+                "attention_mask": {0: "B", 2: "Q", 3: "KV"},
+                "position_ids": {0: "B", 1: "T"},
+                "hidden_states_out": {0: "B", 1: "T"},
+                "present_key": {0: "L", 3: "KV_OUT"},
+                "present_value": {0: "L", 3: "KV_OUT"},
+            },
+            opset_version=13,
+            export_params=True,
+        )
+
+    # 3) Output
+    out = Qwen3OutputModule(base).eval()
+    hs = torch.zeros(1, prefill_len, cfg.hidden_size)
+    torch.onnx.export(
+        out,
+        (hs,),
+        str(onnx_path / "output.onnx"),
+        input_names=["hidden_states"],
+        output_names=["logits"],
+        dynamic_axes={
+            "hidden_states": {0: "B", 1: "T"},
+            "logits": {0: "B", 1: "T"},
+        },
+        opset_version=13,
+        export_params=True,
+    )
+
+    print(f"Exported Prefill ONNX to {onnx_path.resolve()}")
+
+
+def export_decode_onnx(base, onnx_path: Path, max_cache_len: int):
+    """导出 Decode 阶段 ONNX 模型（seq_len=1，带 past KV）。"""
+    cfg = base.config
+    kv_heads = cfg.num_key_value_heads
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    decode_len = 1
+
+    # 1) Embedding
+    emb = Qwen3EmbeddingModule(base).eval()
+    ids = torch.zeros(1, decode_len, dtype=torch.float32)
+    torch.onnx.export(
+        emb,
+        (ids,),
+        str(onnx_path / "embed.onnx"),
+        input_names=["input_ids"],
+        output_names=["hidden_states"],
+        dynamic_axes={
+            "input_ids": {0: "B", 1: "T"},
+            "hidden_states": {0: "B", 1: "T"},
+        },
+        opset_version=13,
+        export_params=True,
+    )
+
+    # 2) Blocks（带 past_key/past_value）
+    blocks = [
+        ("layers_0_6", 0, 7),
+        ("layers_7_13", 7, 14),
+        ("layers_14_20", 14, 21),
+        ("layers_21_27", 21, 28),
+    ]
+    for name, s, e in blocks:
+        blk = Qwen3BlockStackModule(base, s, e).eval()
+        hs = torch.zeros(1, decode_len, cfg.hidden_size)
+        # Decode: 1 token attends to past + self, 最后一维 = max_cache_len + 1
+        attn = torch.zeros(1, 1, decode_len, max_cache_len + decode_len)
+        pos = torch.zeros(1, decode_len, dtype=torch.long)
+        past_shape = (e - s, 1, kv_heads, max_cache_len, head_dim)
         past_key = torch.zeros(past_shape)
         past_value = torch.zeros(past_shape)
         torch.onnx.export(
@@ -89,7 +165,7 @@ def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 512):
 
     # 3) Output
     out = Qwen3OutputModule(base).eval()
-    hs = torch.zeros(1, seq_len, base.config.hidden_size)
+    hs = torch.zeros(1, decode_len, cfg.hidden_size)
     torch.onnx.export(
         out,
         (hs,),
@@ -104,16 +180,38 @@ def export_onnx(model_path: str, onnx_dir: str, seq_len: int = 512):
         export_params=True,
     )
 
-    with open(onnx_path / "config.json", "w", encoding="utf-8") as fw:
+    print(f"Exported Decode ONNX to {onnx_path.resolve()}")
+
+
+def export_onnx(model_path: str, onnx_dir: str, prefill_len: int = 512, max_cache_len: int = 1024):
+    """导出 Prefill 和 Decode 两组 ONNX 模型。"""
+    base = load_base_qwen3(model_path)
+    cfg_dict = base.config.to_dict()
+
+    # Prefill 组
+    prefill_path = Path(onnx_dir) / "prefill"
+    prefill_path.mkdir(parents=True, exist_ok=True)
+    export_prefill_onnx(base, prefill_path, prefill_len)
+    with open(prefill_path / "config.json", "w", encoding="utf-8") as fw:
         json.dump(cfg_dict, fw, indent=2)
 
-    print(f"Exported ONNX (and config) to {onnx_path.resolve()}")
+    # Decode 组
+    decode_path = Path(onnx_dir) / "decode"
+    decode_path.mkdir(parents=True, exist_ok=True)
+    export_decode_onnx(base, decode_path, max_cache_len)
+    with open(decode_path / "config.json", "w", encoding="utf-8") as fw:
+        json.dump(cfg_dict, fw, indent=2)
+
+    print(f"\nAll ONNX exported to {Path(onnx_dir).resolve()}")
+    print(f"  Prefill: {prefill_path.resolve()} (seq_len={prefill_len})")
+    print(f"  Decode:  {decode_path.resolve()} (seq_len=1, max_cache={max_cache_len})")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", default="/home/szm/atlas/qwen3_1.7b")
     ap.add_argument("--onnx_dir", default="./onnx_models")
-    ap.add_argument("--seq_len", type=int, default=512)
+    ap.add_argument("--prefill_len", type=int, default=512)
+    ap.add_argument("--max_cache_len", type=int, default=1024)
     args = ap.parse_args()
-    export_onnx(args.model_path, args.onnx_dir, args.seq_len)
+    export_onnx(args.model_path, args.onnx_dir, args.prefill_len, args.max_cache_len)
