@@ -1,6 +1,6 @@
 """
 4 节点分布式推理配置模块
-支持 Qwen 模型的 4 节点分布式推理
+支持 Qwen 模型的 4 节点分布式推理（Prefill + Decode 双模型）
 """
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
@@ -11,10 +11,12 @@ import json
 @dataclass
 class DistributedConfig4Nodes:
     """4 节点分布式推理配置"""
-    # 模型配置
-    om_dir: str = ""  # OM 模型目录
-    tokenizer_dir: str = ""  # tokenizer 目录（可指向完整模型目录）
-    
+    # 模型配置 - 双模型目录
+    prefill_om_dir: str = ""  # Prefill OM 模型目录
+    decode_om_dir: str = ""   # Decode OM 模型目录
+    om_dir: str = ""          # 兼容旧接口，若设置则 prefill/decode 都用此目录
+    tokenizer_dir: str = ""   # tokenizer 目录
+
     # 模型参数（从 config.json 加载）
     hidden_size: int = 2048
     num_hidden_layers: int = 28
@@ -23,33 +25,26 @@ class DistributedConfig4Nodes:
     head_dim: int = 128
     vocab_size: int = 151936
     max_position_embeddings: int = 40960
-    
+
     # KV Cache 配置
-    max_cache_len: int = 1024  # past_key/past_value 的序列长度
-    max_input_len: int = 512    # 当前输入的最大长度
-    # attention_mask 形状: [1, 1, max_input_len, max_cache_len + max_input_len]
-    # 即 [1, 1, 512, 1536]
-    
+    max_cache_len: int = 1024
+    prefill_len: int = 512     # Prefill 阶段的 max_input_len
+    max_input_len: int = 512   # 兼容旧接口，decode 阶段固定为 1
+
     # 采样配置
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 1.0
     greedy: bool = True
     max_gen_len: int = 100
-    
+
     # 设备配置
     device_id: int = 0
-    
+
     # 网络配置
-    node_id: int = 0  # 当前节点 ID (0-3)
-    total_nodes: int = 4  # 总节点数
-    
-    # 节点角色映射（4 节点架构）
-    # Node 0: embed.om + layers_0_6.om (头节点，层 0-6)
-    # Node 1: layers_7_13.om (中间节点1，层 7-13)
-    # Node 2: layers_14_20.om (中间节点2，层 14-20)
-    # Node 3: layers_21_27.om + output.om (尾节点，层 21-27)
-    
+    node_id: int = 0
+    total_nodes: int = 4
+
     # 网络地址配置
     node_addresses: Dict[int, Dict[str, any]] = field(default_factory=lambda: {
         0: {"ip": "192.168.137.100", "port": 9000},
@@ -57,92 +52,79 @@ class DistributedConfig4Nodes:
         2: {"ip": "192.168.137.102", "port": 9002},
         3: {"ip": "192.168.137.103", "port": 9003},
     })
-    
-    # 每个节点的模型文件
+
+    # 每个节点的模型文件（prefill 和 decode 共用相同文件名，目录不同）
     node_models: Dict[int, List[str]] = field(default_factory=lambda: {
         0: ["embed.om", "layers_0_6.om"],
         1: ["layers_7_13.om"],
         2: ["layers_14_20.om"],
         3: ["layers_21_27.om", "output.om"],
     })
-    
-    # 每个节点的 transformer 层数（用于 KV Cache）
-    # Node 0: 层 0-6 = 7 层
-    # Node 1: 层 7-13 = 7 层
-    # Node 2: 层 14-20 = 7 层
-    # Node 3: 层 21-27 = 7 层
+
     node_layers: Dict[int, int] = field(default_factory=lambda: {
-        0: 7,   # layers 0-6
-        1: 7,   # layers 7-13
-        2: 7,   # layers 14-20
-        3: 7,   # layers 21-27
+        0: 7,
+        1: 7,
+        2: 7,
+        3: 7,
     })
-    
+
     # EOS token ID
     eos_token_id: int = 151645
     bos_token_id: int = 151643
-    
+
     def __post_init__(self):
-        """初始化后验证配置"""
+        """初始化后处理"""
+        # 兼容旧接口：如果只设了 om_dir，prefill/decode 都用它
+        if self.om_dir and not self.prefill_om_dir:
+            self.prefill_om_dir = self.om_dir
+        if self.om_dir and not self.decode_om_dir:
+            self.decode_om_dir = self.om_dir
+
         self._validate_config()
-        if self.om_dir and os.path.isdir(self.om_dir):
-            config_path = os.path.join(self.om_dir, "config.json")
-            if os.path.exists(config_path):
-                self._load_model_config(config_path)
-    
+
+        # 从 prefill 目录加载 config.json
+        for d in [self.prefill_om_dir, self.decode_om_dir]:
+            if d and os.path.isdir(d):
+                config_path = os.path.join(d, "config.json")
+                if os.path.exists(config_path):
+                    self._load_model_config(config_path)
+                    break
+
     def _validate_config(self):
-        """验证配置参数的合法性"""
-        # 验证节点 ID
         if not 0 <= self.node_id < self.total_nodes:
-            raise ValueError(f"Invalid node_id: {self.node_id}, must be in range [0, {self.total_nodes})")
-        
-        # 验证设备 ID
+            raise ValueError(f"Invalid node_id: {self.node_id}")
         if self.device_id < 0:
-            raise ValueError(f"Invalid device_id: {self.device_id}, must be >= 0")
-        
-        # 验证 KV Cache 配置
+            raise ValueError(f"Invalid device_id: {self.device_id}")
         if self.max_cache_len <= 0:
-            raise ValueError(f"Invalid max_cache_len: {self.max_cache_len}, must be > 0")
-        if self.max_input_len <= 0 or self.max_input_len > self.max_cache_len:
-            raise ValueError(f"Invalid max_input_len: {self.max_input_len}, must be in (0, {self.max_cache_len}]")
-        
-        # 验证采样参数
+            raise ValueError(f"Invalid max_cache_len: {self.max_cache_len}")
+        if self.prefill_len <= 0:
+            raise ValueError(f"Invalid prefill_len: {self.prefill_len}")
         if self.temperature <= 0:
-            raise ValueError(f"Invalid temperature: {self.temperature}, must be > 0")
+            raise ValueError(f"Invalid temperature: {self.temperature}")
         if self.top_k < 0:
-            raise ValueError(f"Invalid top_k: {self.top_k}, must be >= 0")
+            raise ValueError(f"Invalid top_k: {self.top_k}")
         if not 0 < self.top_p <= 1.0:
-            raise ValueError(f"Invalid top_p: {self.top_p}, must be in (0, 1]")
+            raise ValueError(f"Invalid top_p: {self.top_p}")
         if self.max_gen_len <= 0:
-            raise ValueError(f"Invalid max_gen_len: {self.max_gen_len}, must be > 0")
-        
-        # 验证模型参数
+            raise ValueError(f"Invalid max_gen_len: {self.max_gen_len}")
         if self.hidden_size <= 0:
-            raise ValueError(f"Invalid hidden_size: {self.hidden_size}, must be > 0")
+            raise ValueError(f"Invalid hidden_size: {self.hidden_size}")
         if self.num_hidden_layers != 28:
-            raise ValueError(f"Invalid num_hidden_layers: {self.num_hidden_layers}, must be 28 for 4-node setup")
+            raise ValueError(f"Invalid num_hidden_layers: {self.num_hidden_layers}")
         if self.num_attention_heads <= 0:
-            raise ValueError(f"Invalid num_attention_heads: {self.num_attention_heads}, must be > 0")
+            raise ValueError(f"Invalid num_attention_heads: {self.num_attention_heads}")
         if self.num_key_value_heads <= 0 or self.num_key_value_heads > self.num_attention_heads:
             raise ValueError(f"Invalid num_key_value_heads: {self.num_key_value_heads}")
         if self.vocab_size <= 0:
-            raise ValueError(f"Invalid vocab_size: {self.vocab_size}, must be > 0")
-        
-        # 验证 OM 目录
-        if self.om_dir and not os.path.isdir(self.om_dir):
-            raise ValueError(f"OM directory does not exist: {self.om_dir}")
-        
-        # 验证节点配置一致性
+            raise ValueError(f"Invalid vocab_size: {self.vocab_size}")
         if len(self.node_layers) != self.total_nodes:
             raise ValueError(f"node_layers must have {self.total_nodes} entries")
         if sum(self.node_layers.values()) != self.num_hidden_layers:
-            raise ValueError(f"Sum of node_layers ({sum(self.node_layers.values())}) must equal num_hidden_layers ({self.num_hidden_layers})")
-    
+            raise ValueError(f"Sum of node_layers must equal num_hidden_layers")
+
     def _load_model_config(self, config_path: str):
-        """从 config.json 加载模型配置"""
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        
         self.hidden_size = cfg.get("hidden_size", self.hidden_size)
         self.num_hidden_layers = cfg.get("num_hidden_layers", self.num_hidden_layers)
         self.num_attention_heads = cfg.get("num_attention_heads", self.num_attention_heads)
@@ -152,48 +134,51 @@ class DistributedConfig4Nodes:
         self.max_position_embeddings = cfg.get("max_position_embeddings", self.max_position_embeddings)
         self.eos_token_id = cfg.get("eos_token_id", self.eos_token_id)
         self.bos_token_id = cfg.get("bos_token_id", self.bos_token_id)
-    
-    def get_model_paths(self, node_id: int = None) -> List[str]:
-        """获取指定节点的模型路径列表"""
+
+    def get_prefill_model_paths(self, node_id: int = None) -> List[str]:
+        """获取 prefill 模型路径"""
         if node_id is None:
             node_id = self.node_id
         model_files = self.node_models.get(node_id, [])
-        return [os.path.join(self.om_dir, f) for f in model_files]
-    
+        return [os.path.join(self.prefill_om_dir, f) for f in model_files]
+
+    def get_decode_model_paths(self, node_id: int = None) -> List[str]:
+        """获取 decode 模型路径"""
+        if node_id is None:
+            node_id = self.node_id
+        model_files = self.node_models.get(node_id, [])
+        return [os.path.join(self.decode_om_dir, f) for f in model_files]
+
+    def get_model_paths(self, node_id: int = None) -> List[str]:
+        """兼容旧接口，返回 decode 模型路径"""
+        return self.get_decode_model_paths(node_id)
+
     def get_next_node_address(self) -> Optional[Dict[str, any]]:
-        """获取下一个节点的地址"""
         next_id = self.node_id + 1
         if next_id >= self.total_nodes:
             return None
         return self.node_addresses.get(next_id)
-    
+
     def get_prev_node_address(self) -> Optional[Dict[str, any]]:
-        """获取上一个节点的地址"""
         prev_id = self.node_id - 1
         if prev_id < 0:
             return None
         return self.node_addresses.get(prev_id)
-    
+
     def get_head_node_address(self) -> Dict[str, any]:
-        """获取头节点（Node 0）的地址"""
         return self.node_addresses.get(0)
-    
+
     def get_listen_port(self) -> int:
-        """获取当前节点的监听端口"""
         return self.node_addresses.get(self.node_id, {}).get("port", 9000 + self.node_id)
-    
+
     def get_num_layers(self) -> int:
-        """获取当前节点的层数"""
         return self.node_layers.get(self.node_id, 7)
-    
+
     def is_head_node(self) -> bool:
-        """是否是头节点"""
         return self.node_id == 0
-    
+
     def is_tail_node(self) -> bool:
-        """是否是尾节点"""
         return self.node_id == self.total_nodes - 1
-    
+
     def is_middle_node(self) -> bool:
-        """是否是中间节点"""
         return not self.is_head_node() and not self.is_tail_node()

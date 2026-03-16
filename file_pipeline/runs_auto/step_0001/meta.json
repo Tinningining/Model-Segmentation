@@ -1,0 +1,8 @@
+{
+  "mode": "decode",
+  "past_len": 197,
+  "q_len": 1,
+  "next_past_len": 198,
+  "max_cache_len": 1024,
+  "max_input_len": 1
+}

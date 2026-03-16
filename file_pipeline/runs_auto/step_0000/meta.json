@@ -1,0 +1,8 @@
+{
+  "mode": "prefill",
+  "past_len": 0,
+  "q_len": 197,
+  "next_past_len": 197,
+  "max_cache_len": 1024,
+  "max_input_len": 512
+}

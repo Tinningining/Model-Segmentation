@@ -158,7 +158,7 @@ class NodeClient:
         self.node_name = node_name
         self.sock = None
     
-    def connect(self, retry_interval: float = 1.0, max_retries: int = 60) -> bool:
+    def connect(self, retry_interval: float = 1.0, max_retries: int = 600) -> bool:
         """连接到目标节点"""
         for i in range(max_retries):
             # 每次重试创建新的 socket（避免资源泄露）

@@ -28,8 +28,9 @@ class MiddleNode4Nodes:
         self.server = None  # 接收上一个节点的数据
         self.client = None  # 发送到下一个节点
         
-        # 模型（常驻内存）
+        # 模型（按需加载，同一时间只保留一组）
         self.block_model = None
+        self._loaded_mode = None  # "prefill" / "decode" / None
         
         # KV Cache
         self.kv_cache = None
@@ -46,12 +47,14 @@ class MiddleNode4Nodes:
         """初始化节点"""
         print(f"[{self.node_name}] Initializing...")
         
-        # 1. 加载模型（常驻内存）
-        model_paths = self.config.get_model_paths()
+        # 1. 模型路径
+        self._prefill_paths = self.config.get_prefill_model_paths()
+        self._decode_paths = self.config.get_decode_model_paths()
+        print(f"[{self.node_name}] Prefill model: {self._prefill_paths[0]}")
+        print(f"[{self.node_name}] Decode model: {self._decode_paths[0]}")
         
-        print(f"[{self.node_name}] Loading model: {model_paths[0]}")
-        self.block_model = ACLModel(model_paths[0], self.config.device_id)
-        self.block_model.init()
+        print(f"[{self.node_name}] Loading prefill model...")
+        self._ensure_mode("prefill")
         
         # 2. 初始化 KV Cache
         num_layers = self.config.get_num_layers()  # 7 层
@@ -77,7 +80,8 @@ class MiddleNode4Nodes:
         next_addr = self.config.get_next_node_address()
         if next_addr:
             self.client = NodeClient(next_addr["ip"], next_addr["port"], self.node_name)
-            self.client.connect()
+            if not self.client.connect():
+                raise RuntimeError(f"Cannot connect to next node {next_addr['ip']}:{next_addr['port']}")
         
         # 6. 等待上一个节点连接
         print(f"[{self.node_name}] Waiting for previous node connection...")
@@ -85,35 +89,82 @@ class MiddleNode4Nodes:
         
         print(f"[{self.node_name}] Initialization complete!")
     
+    def _ensure_mode(self, mode: str):
+        """确保当前加载的模型与所需模式一致"""
+        if self._loaded_mode == mode:
+            return
+        if self.block_model is not None:
+            print(f"[{self.node_name}] Unloading {self._loaded_mode} block model...")
+            self.block_model.finalize()
+            self.block_model = None
+        paths = self._prefill_paths if mode == "prefill" else self._decode_paths
+        print(f"[{self.node_name}] Loading {mode} model...")
+        self.block_model = ACLModel(paths[0], self.config.device_id)
+        self.block_model.init()
+        self._loaded_mode = mode
+        print(f"[{self.node_name}] {mode} model loaded.")
+
     def run_block(self, hidden: np.ndarray, attention_mask: np.ndarray,
-                  position_ids: np.ndarray, q_len: int) -> np.ndarray:
+                  position_ids: np.ndarray, q_len: int, mode: str = "decode") -> np.ndarray:
         """运行 transformer block"""
-        past_key, past_value = self.kv_cache.get_cache()
-        
-        inputs = [
-            hidden.astype(np.float32),
-            attention_mask.astype(np.float32),
-            position_ids.astype(np.int64),
-            past_key.astype(np.float32),
-            past_value.astype(np.float32),
-        ]
+        self._ensure_mode(mode)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+            ]
+        else:
+            cur_input_len = 1
+            past_key, past_value = self.kv_cache.get_cache()
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+                past_key.astype(np.float32),
+                past_value.astype(np.float32),
+            ]
         
         outputs = self.block_model.execute(inputs)
         
         hidden_out = reshape_hidden_output(
             outputs[0], batch_size=1,
-            max_input_len=self.config.max_input_len,
+            max_input_len=cur_input_len,
             hidden_size=self.config.hidden_size
         )
         
-        # 更新 KV Cache
         num_layers = self.config.get_num_layers()
-        target_shape = (num_layers, 1, self.config.num_key_value_heads,
-                        self.config.max_input_len, self.config.head_dim)
-        num_elements = np.prod(target_shape)
         
-        present_key = outputs[1].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
-        present_value = outputs[2].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
+        if mode == "prefill":
+            # Prefill: present_key shape = (layers, 1, heads, prefill_len, head_dim)
+            # 有效数据在前 q_len 个位置
+            kv_seq_dim = cur_input_len
+        else:
+            # Decode: OM 模型输出的是 cat([past_key, new_key]) 的完整结果
+            # shape = (layers, 1, heads, max_cache_len + decode_len, head_dim)
+            # 新 token 的 KV 在 past_len 位置
+            kv_seq_dim = self.config.max_cache_len + cur_input_len
+        
+        target_shape = (num_layers, 1, self.config.num_key_value_heads,
+                        kv_seq_dim, self.config.head_dim)
+        num_elements = np.prod(target_shape)
+
+        k_bytes = outputs[1].astype(np.uint8).tobytes()
+        v_bytes = outputs[2].astype(np.uint8).tobytes()
+
+        present_key_full = np.frombuffer(k_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        present_value_full = np.frombuffer(v_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        
+        if mode == "prefill":
+            # Prefill: 有效 KV 在前 q_len 个位置
+            present_key = present_key_full[:, :, :, :q_len, :]
+            present_value = present_value_full[:, :, :, :q_len, :]
+        else:
+            # Decode: 新 token 的 KV 在 past_len 位置
+            past_len = self.kv_cache.get_current_len()
+            present_key = present_key_full[:, :, :, past_len:past_len + q_len, :]
+            present_value = present_value_full[:, :, :, past_len:past_len + q_len, :]
         
         self.kv_cache.update(present_key.astype(np.float16), present_value.astype(np.float16), q_len)
         
@@ -138,10 +189,11 @@ class MiddleNode4Nodes:
                 meta = msg.data.get("meta", {})
                 
                 q_len = meta.get("q_len", 1)
+                mode = meta.get("mode", "decode")
                 self.past_len = meta.get("past_len", 0)
                 
                 # 运行 block
-                hidden_out = self.run_block(hidden, attention_mask, position_ids, q_len)
+                hidden_out = self.run_block(hidden, attention_mask, position_ids, q_len, mode)
                 
                 # 转发到下一个节点
                 forward_msg = DistributedMessage.create_forward_msg(
@@ -231,10 +283,11 @@ class MiddleNode4Nodes:
 def main():
     parser = argparse.ArgumentParser(description="Middle Node - 4 Nodes Version")
     parser.add_argument("--node_id", type=int, required=True, choices=[1, 2], help="Node ID (1 or 2)")
-    parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
+    parser.add_argument("--prefill_om_dir", type=str, required=True, help="Prefill OM model directory")
+    parser.add_argument("--decode_om_dir", type=str, required=True, help="Decode OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=512)
+    parser.add_argument("--prefill_len", type=int, default=512)
     parser.add_argument("--listen_port", type=int, default=None, help="Listen port (default: 9000 + node_id)")
     parser.add_argument("--next_ip", type=str, default=None, help="Next node IP")
     parser.add_argument("--next_port", type=int, default=None, help="Next node port")
@@ -256,10 +309,11 @@ def main():
         args.next_ip = default_ips.get(args.node_id, "127.0.0.1")
     
     config = DistributedConfig4Nodes(
-        om_dir=args.om_dir,
+        prefill_om_dir=args.prefill_om_dir,
+        decode_om_dir=args.decode_om_dir,
         device_id=args.device,
         max_cache_len=args.max_cache_len,
-        max_input_len=args.max_input_len,
+        prefill_len=args.prefill_len,
         node_id=args.node_id,
     )
     

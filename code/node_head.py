@@ -16,7 +16,7 @@ from network import NodeServer, NodeClient, DistributedMessage
 from acl_model import ACLModel
 from kvcache import create_kvcache
 from utils import (
-    build_attention_mask, build_position_ids,
+    build_attention_mask, build_prefill_attention_mask, build_position_ids,
     decode_incremental_text, decode_token_ids,
     encode_text, load_tokenizer, pad_input_ids, reshape_hidden_output,
     build_chat_prompt, build_tool_system_prompt, build_tool_result_prompt,
@@ -44,9 +44,10 @@ class HeadNodeWithTools:
         self.server = None
         self.client = None
         
-        # 模型（常驻内存）
+        # 模型（按需加载，同一时间只保留一组）
         self.embed_model = None
         self.block_model = None
+        self._loaded_mode = None  # "prefill" / "decode" / None
         
         # KV Cache
         self.kv_cache = None
@@ -76,15 +77,14 @@ class HeadNodeWithTools:
         """初始化节点"""
         print(f"[{self.node_name}] Initializing...")
         
-        # 1. 加载模型
-        model_paths = self.config.get_model_paths()
+        # 1. 模型路径 + 直接加载 prefill 模型
+        self._prefill_paths = self.config.get_prefill_model_paths()
+        self._decode_paths = self.config.get_decode_model_paths()
+        print(f"[{self.node_name}] Prefill models: {self._prefill_paths}")
+        print(f"[{self.node_name}] Decode models: {self._decode_paths}")
         
-        print(f"[{self.node_name}] Loading models...")
-        self.embed_model = ACLModel(model_paths[0], self.config.device_id)
-        self.embed_model.init()
-        
-        self.block_model = ACLModel(model_paths[1], self.config.device_id)
-        self.block_model.init()
+        print(f"[{self.node_name}] Loading prefill models...")
+        self._ensure_mode("prefill")
         
         # 2. 加载 tokenizer
         if self.config.tokenizer_dir:
@@ -115,7 +115,8 @@ class HeadNodeWithTools:
         next_addr = self.config.get_next_node_address()
         if next_addr:
             self.client = NodeClient(next_addr["ip"], next_addr["port"], self.node_name)
-            self.client.connect()
+            if not self.client.connect():
+                raise RuntimeError(f"Cannot connect to next node {next_addr['ip']}:{next_addr['port']}")
         
         # 7. 等待尾节点连接
         print(f"[{self.node_name}] Waiting for tail node connection...")
@@ -160,64 +161,128 @@ class HeadNodeWithTools:
         print(f"[{self.node_name}] Tool system initialized with {len(self.tool_manager.list_tools())} tools")
         print(f"[{self.node_name}] Supports devices: {devices}")
     
-    def run_embed(self, input_ids: np.ndarray) -> np.ndarray:
+    def _ensure_mode(self, mode: str):
+        """确保当前加载的模型与所需模式一致，不一致则卸载旧模型并加载新模型"""
+        if self._loaded_mode == mode:
+            return
+        # 卸载当前模型
+        if self.embed_model is not None:
+            print(f"[{self.node_name}] Unloading {self._loaded_mode} embed model...")
+            self.embed_model.finalize()
+            self.embed_model = None
+        if self.block_model is not None:
+            print(f"[{self.node_name}] Unloading {self._loaded_mode} block model...")
+            self.block_model.finalize()
+            self.block_model = None
+        # 加载新模型
+        paths = self._prefill_paths if mode == "prefill" else self._decode_paths
+        print(f"[{self.node_name}] Loading {mode} models...")
+        self.embed_model = ACLModel(paths[0], self.config.device_id)
+        self.embed_model.init()
+        self.block_model = ACLModel(paths[1], self.config.device_id)
+        self.block_model.init()
+        self._loaded_mode = mode
+        print(f"[{self.node_name}] {mode} models loaded.")
+
+    def run_embed(self, input_ids: np.ndarray, mode: str = "decode") -> np.ndarray:
         """运行 embedding"""
-        embed_ids = pad_input_ids(input_ids, self.config.max_input_len, pad_id=0)
+        self._ensure_mode(mode)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+        else:
+            cur_input_len = 1
+        
+        embed_ids = pad_input_ids(input_ids, cur_input_len, pad_id=0)
         outputs = self.embed_model.execute([embed_ids])
-        hidden = outputs[0].view(np.float32).reshape(
-            1, self.config.max_input_len, self.config.hidden_size
-        )
+        hidden = outputs[0].view(np.float32).reshape(1, cur_input_len, self.config.hidden_size)
         return hidden
     
     def run_block(self, hidden: np.ndarray, attention_mask: np.ndarray,
-                  position_ids: np.ndarray, q_len: int) -> np.ndarray:
+                  position_ids: np.ndarray, q_len: int, mode: str = "decode") -> np.ndarray:
         """运行 transformer block"""
-        past_key, past_value = self.kv_cache.get_cache()
-        
-        inputs = [
-            hidden.astype(np.float32),
-            attention_mask.astype(np.float32),
-            position_ids.astype(np.int64),
-            past_key.astype(np.float32),
-            past_value.astype(np.float32),
-        ]
+        self._ensure_mode(mode)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+            ]
+        else:
+            cur_input_len = 1
+            past_key, past_value = self.kv_cache.get_cache()
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+                past_key.astype(np.float32),
+                past_value.astype(np.float32),
+            ]
         
         outputs = self.block_model.execute(inputs)
         
         hidden_out = reshape_hidden_output(
             outputs[0], batch_size=1,
-            max_input_len=self.config.max_input_len,
+            max_input_len=cur_input_len,
             hidden_size=self.config.hidden_size
         )
         
         # 更新 KV Cache
         num_layers = self.config.get_num_layers()
-        target_shape = (num_layers, 1, self.config.num_key_value_heads,
-                        self.config.max_input_len, self.config.head_dim)
-        num_elements = np.prod(target_shape)
         
-        present_key = outputs[1].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
-        present_value = outputs[2].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
+        if mode == "prefill":
+            # Prefill: present_key shape = (layers, 1, heads, prefill_len, head_dim)
+            # 有效数据在前 q_len 个位置
+            kv_seq_dim = cur_input_len
+        else:
+            # Decode: OM 模型输出的是 cat([past_key, new_key]) 的完整结果
+            # shape = (layers, 1, heads, max_cache_len + decode_len, head_dim)
+            # 新 token 的 KV 在 past_len 位置（即紧接着已有 cache 之后）
+            kv_seq_dim = self.config.max_cache_len + cur_input_len
+        
+        target_shape = (num_layers, 1, self.config.num_key_value_heads,
+                        kv_seq_dim, self.config.head_dim)
+        num_elements = np.prod(target_shape)
+
+        k_bytes = outputs[1].astype(np.uint8).tobytes()
+        v_bytes = outputs[2].astype(np.uint8).tobytes()
+
+        present_key_full = np.frombuffer(k_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        present_value_full = np.frombuffer(v_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        
+        if mode == "prefill":
+            # Prefill: 有效 KV 在前 q_len 个位置
+            present_key = present_key_full[:, :, :, :q_len, :]
+            present_value = present_value_full[:, :, :, :q_len, :]
+        else:
+            # Decode: 新 token 的 KV 在 past_len 位置
+            past_len = self.kv_cache.get_current_len()
+            present_key = present_key_full[:, :, :, past_len:past_len + q_len, :]
+            present_value = present_value_full[:, :, :, past_len:past_len + q_len, :]
         
         self.kv_cache.update(present_key.astype(np.float16), present_value.astype(np.float16), q_len)
         
         return hidden_out
     
-    def process_forward(self, input_ids: np.ndarray, q_len: int):
+    def process_forward(self, input_ids: np.ndarray, q_len: int, mode: str = "decode"):
         """处理一次前向传播"""
-        hidden = self.run_embed(input_ids)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+        else:
+            cur_input_len = 1
         
-        attention_mask = build_attention_mask(
-            self.past_len, q_len,
-            self.config.max_cache_len,
-            self.config.max_input_len
-        )
-        position_ids = build_position_ids(
-            self.past_len, q_len,
-            self.config.max_input_len
-        )
+        hidden = self.run_embed(input_ids, mode)
         
-        hidden = self.run_block(hidden, attention_mask, position_ids, q_len)
+        if mode == "prefill":
+            attention_mask = build_prefill_attention_mask(q_len, cur_input_len)
+        else:
+            attention_mask = build_attention_mask(
+                self.past_len, q_len,
+                self.config.max_cache_len, cur_input_len
+            )
+        position_ids = build_position_ids(self.past_len, q_len, cur_input_len)
+        
+        hidden = self.run_block(hidden, attention_mask, position_ids, q_len, mode)
         
         return hidden, attention_mask, position_ids
     
@@ -316,15 +381,20 @@ class HeadNodeWithTools:
                         reached_eos = True
                         break
                     
+                    # 确定当前模式
+                    mode = "prefill" if self.past_len == 0 and q_len > 1 else "decode"
+                    cur_input_len = self.config.prefill_len if mode == "prefill" else 1
+                    
                     # 处理前向传播
-                    hidden, attention_mask, position_ids = self.process_forward(current_ids, q_len)
+                    hidden, attention_mask, position_ids = self.process_forward(current_ids, q_len, mode)
                     
                     # 构建元数据
                     meta = {
+                        "mode": mode,
                         "past_len": self.past_len,
                         "q_len": q_len,
                         "max_cache_len": self.config.max_cache_len,
-                        "max_input_len": self.config.max_input_len,
+                        "max_input_len": cur_input_len,
                     }
                     
                     # 发送到下一个节点
@@ -567,10 +637,11 @@ class HeadNodeWithTools:
 
 def main():
     parser = argparse.ArgumentParser(description="Node 0: Head Node with Tools - 4 Nodes Version")
-    parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
+    parser.add_argument("--prefill_om_dir", type=str, required=True, help="Prefill OM model directory")
+    parser.add_argument("--decode_om_dir", type=str, required=True, help="Decode OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=512)
+    parser.add_argument("--prefill_len", type=int, default=512)
     parser.add_argument("--input_file", type=str, required=True, help="Input text file")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -590,11 +661,12 @@ def main():
     args = parser.parse_args()
     
     config = DistributedConfig4Nodes(
-        om_dir=args.om_dir,
+        prefill_om_dir=args.prefill_om_dir,
+        decode_om_dir=args.decode_om_dir,
         tokenizer_dir=args.tokenizer_dir,
         device_id=args.device,
         max_cache_len=args.max_cache_len,
-        max_input_len=args.max_input_len,
+        prefill_len=args.prefill_len,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,

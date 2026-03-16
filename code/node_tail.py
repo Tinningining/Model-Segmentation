@@ -27,9 +27,10 @@ class TailNode4Nodes:
         self.server = None  # 接收上一个节点的数据
         self.client = None  # 发送结果回头节点
         
-        # 模型（常驻内存）
+        # 模型（按需加载，同一时间只保留一组）
         self.block_model = None
         self.output_model = None
+        self._loaded_mode = None  # "prefill" / "decode" / None
         
         # KV Cache
         self.kv_cache = None
@@ -46,15 +47,14 @@ class TailNode4Nodes:
         """初始化节点"""
         print(f"[{self.node_name}] Initializing...")
         
-        # 1. 加载模型（常驻内存）
-        model_paths = self.config.get_model_paths()
+        # 1. 模型路径
+        self._prefill_paths = self.config.get_prefill_model_paths()
+        self._decode_paths = self.config.get_decode_model_paths()
+        print(f"[{self.node_name}] Prefill models: {self._prefill_paths}")
+        print(f"[{self.node_name}] Decode models: {self._decode_paths}")
         
-        print(f"[{self.node_name}] Loading models...")
-        self.block_model = ACLModel(model_paths[0], self.config.device_id)
-        self.block_model.init()
-        
-        self.output_model = ACLModel(model_paths[1], self.config.device_id)
-        self.output_model.init()
+        print(f"[{self.node_name}] Loading prefill models...")
+        self._ensure_mode("prefill")
         
         # 2. 初始化 KV Cache
         num_layers = self.config.get_num_layers()  # 7 层
@@ -79,7 +79,8 @@ class TailNode4Nodes:
         # 5. 连接到头节点（返回结果）
         head_addr = self.config.get_head_node_address()
         self.client = NodeClient(head_addr["ip"], head_addr["port"], self.node_name)
-        self.client.connect()
+        if not self.client.connect():
+            raise RuntimeError(f"Cannot connect to head node {head_addr['ip']}:{head_addr['port']}")
         
         # 6. 等待上一个节点连接
         print(f"[{self.node_name}] Waiting for previous node connection...")
@@ -87,50 +88,108 @@ class TailNode4Nodes:
         
         print(f"[{self.node_name}] Initialization complete!")
     
+    def _ensure_mode(self, mode: str):
+        """确保当前加载的模型与所需模式一致"""
+        if self._loaded_mode == mode:
+            return
+        if self.block_model is not None:
+            print(f"[{self.node_name}] Unloading {self._loaded_mode} block model...")
+            self.block_model.finalize()
+            self.block_model = None
+        if self.output_model is not None:
+            print(f"[{self.node_name}] Unloading {self._loaded_mode} output model...")
+            self.output_model.finalize()
+            self.output_model = None
+        paths = self._prefill_paths if mode == "prefill" else self._decode_paths
+        print(f"[{self.node_name}] Loading {mode} models...")
+        self.block_model = ACLModel(paths[0], self.config.device_id)
+        self.block_model.init()
+        self.output_model = ACLModel(paths[1], self.config.device_id)
+        self.output_model.init()
+        self._loaded_mode = mode
+        print(f"[{self.node_name}] {mode} models loaded.")
+
     def run_block(self, hidden: np.ndarray, attention_mask: np.ndarray,
-                  position_ids: np.ndarray, q_len: int) -> np.ndarray:
+                  position_ids: np.ndarray, q_len: int, mode: str = "decode") -> np.ndarray:
         """运行 transformer block"""
-        past_key, past_value = self.kv_cache.get_cache()
-        
-        inputs = [
-            hidden.astype(np.float32),
-            attention_mask.astype(np.float32),
-            position_ids.astype(np.int64),
-            past_key.astype(np.float32),
-            past_value.astype(np.float32),
-        ]
+        self._ensure_mode(mode)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+            ]
+        else:
+            cur_input_len = 1
+            past_key, past_value = self.kv_cache.get_cache()
+            inputs = [
+                hidden.astype(np.float32),
+                attention_mask.astype(np.float32),
+                position_ids.astype(np.int64),
+                past_key.astype(np.float32),
+                past_value.astype(np.float32),
+            ]
         
         outputs = self.block_model.execute(inputs)
         
         hidden_out = reshape_hidden_output(
             outputs[0], batch_size=1,
-            max_input_len=self.config.max_input_len,
+            max_input_len=cur_input_len,
             hidden_size=self.config.hidden_size
         )
         
-        # 更新 KV Cache
         num_layers = self.config.get_num_layers()
-        target_shape = (num_layers, 1, self.config.num_key_value_heads,
-                        self.config.max_input_len, self.config.head_dim)
-        num_elements = np.prod(target_shape)
         
-        present_key = outputs[1].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
-        present_value = outputs[2].view(np.float32).reshape(-1)[:num_elements].reshape(target_shape)
+        if mode == "prefill":
+            # Prefill: present_key shape = (layers, 1, heads, prefill_len, head_dim)
+            # 有效数据在前 q_len 个位置
+            kv_seq_dim = cur_input_len
+        else:
+            # Decode: OM 模型输出的是 cat([past_key, new_key]) 的完整结果
+            # shape = (layers, 1, heads, max_cache_len + decode_len, head_dim)
+            # 新 token 的 KV 在 past_len 位置
+            kv_seq_dim = self.config.max_cache_len + cur_input_len
+        
+        target_shape = (num_layers, 1, self.config.num_key_value_heads,
+                        kv_seq_dim, self.config.head_dim)
+        num_elements = np.prod(target_shape)
+
+        k_bytes = outputs[1].astype(np.uint8).tobytes()
+        v_bytes = outputs[2].astype(np.uint8).tobytes()
+
+        present_key_full = np.frombuffer(k_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        present_value_full = np.frombuffer(v_bytes, dtype=np.float32)[:num_elements].reshape(target_shape)
+        
+        if mode == "prefill":
+            # Prefill: 有效 KV 在前 q_len 个位置
+            present_key = present_key_full[:, :, :, :q_len, :]
+            present_value = present_value_full[:, :, :, :q_len, :]
+        else:
+            # Decode: 新 token 的 KV 在 past_len 位置
+            past_len = self.kv_cache.get_current_len()
+            present_key = present_key_full[:, :, :, past_len:past_len + q_len, :]
+            present_value = present_value_full[:, :, :, past_len:past_len + q_len, :]
         
         self.kv_cache.update(present_key.astype(np.float16), present_value.astype(np.float16), q_len)
         
         return hidden_out
     
-    def run_output(self, hidden: np.ndarray, q_len: int) -> np.ndarray:
+    def run_output(self, hidden: np.ndarray, q_len: int, mode: str = "decode") -> np.ndarray:
         """运行 output 模型"""
-        outputs = self.output_model.execute([hidden.astype(np.float32)])
+        self._ensure_mode(mode)
+        if mode == "prefill":
+            cur_input_len = self.config.prefill_len
+        else:
+            cur_input_len = 1
         
+        outputs = self.output_model.execute([hidden.astype(np.float32)])
         raw_logits = outputs[0].view(np.float32)
         
         if raw_logits.size == self.config.vocab_size:
             logits = raw_logits.reshape(1, -1)
-        elif raw_logits.size == self.config.max_input_len * self.config.vocab_size:
-            logits = raw_logits.reshape(1, self.config.max_input_len, -1)
+        elif raw_logits.size == cur_input_len * self.config.vocab_size:
+            logits = raw_logits.reshape(1, cur_input_len, -1)
             logits = logits[:, q_len-1, :]
         else:
             logits = raw_logits.reshape(1, -1)
@@ -156,13 +215,14 @@ class TailNode4Nodes:
                 meta = msg.data.get("meta", {})
                 
                 q_len = meta.get("q_len", 1)
+                mode = meta.get("mode", "decode")
                 self.past_len = meta.get("past_len", 0)
                 
                 # 运行 block
-                hidden = self.run_block(hidden, attention_mask, position_ids, q_len)
+                hidden = self.run_block(hidden, attention_mask, position_ids, q_len, mode)
                 
                 # 运行 output
-                logits = self.run_output(hidden, q_len)
+                logits = self.run_output(hidden, q_len, mode)
                 
                 # 采样生成 token
                 next_token = sample_token(
@@ -252,10 +312,11 @@ class TailNode4Nodes:
 
 def main():
     parser = argparse.ArgumentParser(description="Node 3: Tail Node - 4 Nodes Version")
-    parser.add_argument("--om_dir", type=str, required=True, help="OM model directory")
+    parser.add_argument("--prefill_om_dir", type=str, required=True, help="Prefill OM model directory")
+    parser.add_argument("--decode_om_dir", type=str, required=True, help="Decode OM model directory")
     parser.add_argument("--device", type=int, default=0, help="Device ID")
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--max_input_len", type=int, default=512)
+    parser.add_argument("--prefill_len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -267,10 +328,11 @@ def main():
     args = parser.parse_args()
     
     config = DistributedConfig4Nodes(
-        om_dir=args.om_dir,
+        prefill_om_dir=args.prefill_om_dir,
+        decode_om_dir=args.decode_om_dir,
         device_id=args.device,
         max_cache_len=args.max_cache_len,
-        max_input_len=args.max_input_len,
+        prefill_len=args.prefill_len,
         temperature=args.temperature,
         top_k=args.top_k,
         top_p=args.top_p,

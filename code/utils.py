@@ -94,6 +94,29 @@ def decode_incremental_text(
     return full_text, full_text
 
 
+def build_prefill_attention_mask(
+    q_len: int,
+    max_input_len: int,
+) -> np.ndarray:
+    """
+    构建 Prefill 阶段的 causal attention mask（无 past KV）
+
+    Args:
+        q_len: 当前输入的序列长度
+        max_input_len: prefill 最大输入长度
+
+    Returns:
+        attention_mask: shape (1, 1, max_input_len, max_input_len)
+    """
+    if q_len > max_input_len:
+        raise ValueError(f"q_len {q_len} exceeds max_input_len {max_input_len}")
+
+    mask = np.full((max_input_len, max_input_len), NEG_INF, dtype=np.float32)
+    for row in range(q_len):
+        mask[row, :row + 1] = 0.0
+    return mask.reshape(1, 1, max_input_len, max_input_len)
+
+
 def build_attention_mask(
     past_len: int,
     q_len: int,
@@ -101,7 +124,7 @@ def build_attention_mask(
     max_input_len: int,
 ) -> np.ndarray:
     """
-    构建静态 attention mask
+    构建 Decode 阶段的静态 attention mask（带 past KV）
 
     Args:
         past_len: 已有的 KV cache 长度

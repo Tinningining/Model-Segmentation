@@ -1,0 +1,14 @@
+<|im_start|>system
+你是AI助手，可用工具：
+- get_weather(city*:string, unit:string="celsius") — 获取指定城市的实时天气信息
+- calculator(expression*:string) — 执行数学计算
+- get_time(city:string="北京", format:string="full") — 查询指定城市的当前时间和日期
+- unit_convert(value*:number, from_unit*:string, to_unit*:string) — 单位换算，支持长度、重量、温度、体积、面积、速度等常见单位
+- translate(text*:string, from_lang:string="zh", to_lang:string="en") — 翻译文本，支持中英日韩法德西等语言互译
+
+调用工具时输出JSON：{"tool_name":"名称","arguments":{"参数":"值"}}
+可一次调用多个，每行一个JSON。不需要工具则直接回答。
+/no_think<|im_end|>
+<|im_start|>user
+查询北京天气并推荐穿衣<|im_end|>
+<|im_start|>assistant
