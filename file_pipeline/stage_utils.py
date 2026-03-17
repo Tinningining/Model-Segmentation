@@ -31,9 +31,10 @@ def load_array(path: Path) -> np.ndarray:
     return np.load(path)
 
 
-def build_prefill_attention_mask(q_len: int, max_input_len: int) -> np.ndarray:
-    """Prefill 阶段的 causal mask，无 past KV。
-    
+def build_system_attention_mask(q_len: int, max_input_len: int) -> np.ndarray:
+    """System 阶段的 causal mask，无 past KV。
+
+    与原 prefill 完全相同。
     shape: (1, 1, max_input_len, max_input_len)
     """
     if q_len > max_input_len:
@@ -44,9 +45,43 @@ def build_prefill_attention_mask(q_len: int, max_input_len: int) -> np.ndarray:
     return mask.reshape(1, 1, max_input_len, max_input_len)
 
 
+def build_prefill_attention_mask(q_len: int, max_input_len: int,
+                                  past_len: int = 0, max_cache_len: int = 0) -> np.ndarray:
+    """Prefill 阶段的 attention mask。
+
+    当 past_len > 0 时，带 past KV 的 causal mask（用于 system KV 之后的 user prefill）。
+    shape: (1, 1, max_input_len, max_cache_len + max_input_len)
+    """
+    if q_len > max_input_len:
+        raise ValueError(f"q_len {q_len} exceeds max_input_len {max_input_len}")
+
+    if past_len == 0 and max_cache_len == 0:
+        # 无 past KV，纯 causal mask（兼容旧行为）
+        mask = np.full((max_input_len, max_input_len), NEG_INF, dtype=np.float32)
+        for row in range(q_len):
+            mask[row, :row + 1] = 0.0
+        return mask.reshape(1, 1, max_input_len, max_input_len)
+    else:
+        # 有 past KV，causal mask 需要 attend to past + current
+        if past_len > max_cache_len:
+            raise ValueError(f"past_len {past_len} exceeds max_cache_len {max_cache_len}")
+        total = max_cache_len + max_input_len
+        mask = np.full((max_input_len, total), NEG_INF, dtype=np.float32)
+        if q_len == 0:
+            return mask.reshape(1, 1, max_input_len, total)
+        # attend to past KV
+        if past_len > 0:
+            mask[:q_len, :past_len] = 0.0
+        # causal mask for current tokens
+        for row in range(q_len):
+            cols_end = max_cache_len + row + 1
+            mask[row, max_cache_len:cols_end] = 0.0
+        return mask.reshape(1, 1, max_input_len, total)
+
+
 def build_decode_attention_mask(past_len: int, q_len: int, max_cache_len: int, max_input_len: int) -> np.ndarray:
     """Decode 阶段的 attention mask，带 past KV。
-    
+
     shape: (1, 1, max_input_len, max_cache_len + max_input_len)
     """
     if q_len > max_input_len:

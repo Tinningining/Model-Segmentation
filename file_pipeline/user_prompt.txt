@@ -1,0 +1,3 @@
+<|im_start|>user
+查询北京天气并推荐穿衣<|im_end|>
+<|im_start|>assistant

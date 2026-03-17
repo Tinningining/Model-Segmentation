@@ -94,16 +94,17 @@ def decode_incremental_text(
     return full_text, full_text
 
 
-def build_prefill_attention_mask(
+def build_system_attention_mask(
     q_len: int,
     max_input_len: int,
 ) -> np.ndarray:
     """
-    构建 Prefill 阶段的 causal attention mask（无 past KV）
+    构建 System 阶段的 causal attention mask（无 past KV）。
+    与原 build_prefill_attention_mask 完全相同。
 
     Args:
-        q_len: 当前输入的序列长度
-        max_input_len: prefill 最大输入长度
+        q_len: system prompt 的 token 长度
+        max_input_len: system 阶段最大输入长度
 
     Returns:
         attention_mask: shape (1, 1, max_input_len, max_input_len)
@@ -115,6 +116,64 @@ def build_prefill_attention_mask(
     for row in range(q_len):
         mask[row, :row + 1] = 0.0
     return mask.reshape(1, 1, max_input_len, max_input_len)
+
+
+def build_prefill_attention_mask(
+    q_len: int,
+    max_input_len: int,
+) -> np.ndarray:
+    """
+    构建 Prefill 阶段的 causal attention mask（无 past KV，兼容旧接口）
+
+    Args:
+        q_len: 当前输入的序列长度
+        max_input_len: prefill 最大输入长度
+
+    Returns:
+        attention_mask: shape (1, 1, max_input_len, max_input_len)
+    """
+    return build_system_attention_mask(q_len, max_input_len)
+
+
+def build_prefill_with_past_attention_mask(
+    q_len: int,
+    max_input_len: int,
+    past_len: int,
+    max_cache_len: int,
+) -> np.ndarray:
+    """
+    构建带 past KV 的 Prefill attention mask（用于 system KV 之后的 user prefill）。
+
+    Args:
+        q_len: 当前 prefill 输入的 token 长度
+        max_input_len: prefill 阶段最大输入长度
+        past_len: 已有的 KV cache 长度（来自 system 阶段）
+        max_cache_len: 最大缓存长度
+
+    Returns:
+        attention_mask: shape (1, 1, max_input_len, max_cache_len + max_input_len)
+    """
+    if q_len > max_input_len:
+        raise ValueError(f"q_len {q_len} exceeds max_input_len {max_input_len}")
+    if past_len > max_cache_len:
+        raise ValueError(f"past_len {past_len} exceeds max_cache_len {max_cache_len}")
+
+    total = max_cache_len + max_input_len
+    mask = np.full((max_input_len, total), NEG_INF, dtype=np.float32)
+
+    if q_len == 0:
+        return mask.reshape(1, 1, max_input_len, total)
+
+    # attend to past KV (system KV cache)
+    if past_len > 0:
+        mask[:q_len, :past_len] = 0.0
+
+    # causal mask for current tokens
+    for row in range(q_len):
+        cols_end = max_cache_len + row + 1
+        mask[row, max_cache_len:cols_end] = 0.0
+
+    return mask.reshape(1, 1, max_input_len, total)
 
 
 def build_attention_mask(

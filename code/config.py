@@ -11,11 +11,16 @@ import json
 @dataclass
 class DistributedConfig4Nodes:
     """4 节点分布式推理配置"""
-    # 模型配置 - 双模型目录
-    prefill_om_dir: str = ""  # Prefill OM 模型目录
+    # 模型配置 - 三模型目录
+    system_om_dir: str = ""   # System OM 模型目录（预计算固定 system prompt）
+    prefill_om_dir: str = ""  # Prefill OM 模型目录（带 past KV）
     decode_om_dir: str = ""   # Decode OM 模型目录
     om_dir: str = ""          # 兼容旧接口，若设置则 prefill/decode 都用此目录
     tokenizer_dir: str = ""   # tokenizer 目录
+
+    # System KV cache 配置
+    system_kv_dir: str = ""   # System KV cache 独立存储目录
+    system_len: int = 256     # System 阶段的 max_input_len
 
     # 模型参数（从 config.json 加载）
     hidden_size: int = 2048
@@ -74,7 +79,9 @@ class DistributedConfig4Nodes:
 
     def __post_init__(self):
         """初始化后处理"""
-        # 兼容旧接口：如果只设了 om_dir，prefill/decode 都用它
+        # 兼容旧接口：如果只设了 om_dir，所有阶段都用它
+        if self.om_dir and not self.system_om_dir:
+            self.system_om_dir = self.om_dir
         if self.om_dir and not self.prefill_om_dir:
             self.prefill_om_dir = self.om_dir
         if self.om_dir and not self.decode_om_dir:
@@ -134,6 +141,13 @@ class DistributedConfig4Nodes:
         self.max_position_embeddings = cfg.get("max_position_embeddings", self.max_position_embeddings)
         self.eos_token_id = cfg.get("eos_token_id", self.eos_token_id)
         self.bos_token_id = cfg.get("bos_token_id", self.bos_token_id)
+
+    def get_system_model_paths(self, node_id: int = None) -> List[str]:
+        """获取 system 模型路径"""
+        if node_id is None:
+            node_id = self.node_id
+        model_files = self.node_models.get(node_id, [])
+        return [os.path.join(self.system_om_dir, f) for f in model_files]
 
     def get_prefill_model_paths(self, node_id: int = None) -> List[str]:
         """获取 prefill 模型路径"""

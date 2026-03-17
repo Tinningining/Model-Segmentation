@@ -8,6 +8,7 @@ from transformers import AutoTokenizer
 
 from stage_utils import (
     PipelineConfig,
+    build_system_attention_mask,
     build_prefill_attention_mask,
     build_decode_attention_mask,
     build_static_position_ids,
@@ -27,8 +28,8 @@ def parse_args():
     parser.add_argument("--write_tokens", action="store_true")
     parser.add_argument("--max_cache_len", type=int, default=None)
     parser.add_argument("--max_input_len", type=int, default=1)
-    parser.add_argument("--mode", type=str, choices=["prefill", "decode"], default="decode",
-                        help="prefill: no past KV; decode: with past KV")
+    parser.add_argument("--mode", type=str, choices=["system", "prefill", "decode"], default="decode",
+                        help="system: 固定 system prompt 无 past KV; prefill: 用户输入带 past KV; decode: 逐 token 生成")
     return parser.parse_args()
 
 
@@ -65,9 +66,14 @@ def main():
         raise ValueError(f"Token length {q_len} exceeds max_input_len={max_input_len}.")
 
     # Build attention mask based on mode
-    if mode == "prefill":
-        attn = build_prefill_attention_mask(q_len, max_input_len)
+    if mode == "system":
+        # System: 纯 causal mask，无 past KV
+        attn = build_system_attention_mask(q_len, max_input_len)
+    elif mode == "prefill":
+        # Prefill: 带 past KV 的 causal mask（past KV 来自 system 阶段）
+        attn = build_prefill_attention_mask(q_len, max_input_len, past_len, max_cache_len)
     else:
+        # Decode
         if past_len + q_len > max_cache_len:
             raise ValueError(f"past_len({past_len}) + q_len({q_len}) > max_cache_len({max_cache_len})")
         attn = build_decode_attention_mask(past_len, q_len, max_cache_len, max_input_len)
