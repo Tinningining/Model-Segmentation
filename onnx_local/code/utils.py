@@ -404,12 +404,13 @@ def build_chat_prompt(system: str, user: str) -> str:
     )
 
 
-def build_tool_system_prompt(tools: list) -> str:
+def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
     """
     根据工具列表构建 system prompt（紧凑格式，节省 token）。
 
     Args:
         tools: OpenAI function calling 格式的工具列表
+        has_history: 是否有历史对话记录
 
     Returns:
         system prompt 字符串
@@ -436,17 +437,50 @@ def build_tool_system_prompt(tools: list) -> str:
         lines.append(f"- {name}({sig}) — {desc}")
 
     tool_list = "\n".join(lines)
-    return (
-        f"你是AI助手，可用工具：\n{tool_list}\n\n"
+    
+    base_prompt = f"你是AI助手，可用工具：\n{tool_list}\n\n"
+    
+    if has_history:
+        base_prompt += (
+            "注意：上面提供了历史对话记录。\n"
+            "- 如果用户问题可以直接从历史对话中找到答案，请直接回答，无需调用工具。\n"
+            "- 如果需要新信息或计算，请调用相应工具。\n\n"
+        )
+    
+    base_prompt += (
         f'调用工具时输出JSON：{{"tool_name":"名称","arguments":{{"参数":"值"}}}}\n'
         f"可一次调用多个，每行一个JSON。不需要工具则直接回答。\n"
         f"/no_think"
     )
+    
+    return base_prompt
+
+
+def build_round2_system_prompt(has_history: bool = False) -> str:
+    """
+    构建第二轮推理的初始 system prompt。
+    
+    Args:
+        has_history: 是否有历史对话记录
+    
+    Returns:
+        system prompt 字符串
+    """
+    if has_history:
+        return (
+            "你是一个AI助手。用户问了一个问题，你调用了工具获取了信息。"
+            "以下是历史对话信息，可以帮助你更好地理解上下文：\n"
+        )
+    else:
+        return (
+            "你是一个AI助手。用户问了一个问题，你调用了工具获取了信息。\n"
+        )
 
 
 def build_tool_result_prompt(user_message: str,
                               tool_calls: list,
                               tool_results: list,
+                              has_history: bool = False,
                               tools: list = None) -> str:
     """
     构建工具结果注入后的 system prompt（第二轮推理）。
@@ -455,6 +489,7 @@ def build_tool_result_prompt(user_message: str,
         user_message: 原始用户问题
         tool_calls: 工具调用列表 [{"name": ..., "arguments": ...}, ...]
         tool_results: 工具结果列表 [{"success": ..., "result": ..., "tool_name": ...}, ...]
+        has_history: 是否有历史对话记录
         tools: OpenAI 格式工具列表（可选，传入则允许模型继续调用工具）
 
     Returns:
@@ -474,11 +509,12 @@ def build_tool_result_prompt(user_message: str,
 
     calls_text = "\n\n".join(call_descriptions)
 
-    prompt = (
-        f"你是一个AI助手。用户问了一个问题，你调用了工具获取了信息。\n\n"
-        f"用户问题：{user_message}\n\n"
-        f"{calls_text}\n\n"
-    )
+    prompt = f"用户问题：{user_message}\n\n{calls_text}\n\n"
+    
+    if has_history:
+        prompt += (
+            "注意：上面提供了历史对话记录。请结合历史信息和工具返回的数据来回答。\n\n"
+        )
 
     if tools:
         tool_desc = json.dumps(tools, ensure_ascii=False, indent=2)
