@@ -7,10 +7,10 @@
 - 使用 ONNX Runtime 执行模型（CPU）
 - 单机运行，无需网络通信
 - 支持工具调用（继承自 code 文件夹）
-- 支持 system/prefill/decode 三阶段推理
+- 支持 prefill/decode 两阶段推理（统一使用 prefill 模型处理所有输入）
 - KV cache 管理
-- **支持多轮对话**：每轮推理都通过 system 模型处理历史记忆
-- **System 模型复用**：同一个 system 模型可处理工具描述、历史记忆、工具结果提示等
+- **支持多轮对话**：每轮推理都通过 prefill 模型处理历史记忆
+- **灵活的历史记忆处理**：prefill 模型可处理工具描述、历史记忆、工具结果提示等
 
 ## 文件结构
 
@@ -111,60 +111,63 @@ python run_local.py --prefill_onnx_dir ../onnx_models/prefill --decode_onnx_dir 
 
 ### 运行多轮对话
 
-使用 `run_local_multiturn.py` 支持多轮对话和工具调用：
+使用 `run_local_multiturn.py` 支持多轮对话和工具调用（仅需 prefill 和 decode 模型）：
 
 ```bash
 # 交互模式
-python run_local_multiturn.py --system_onnx_dir ../onnx_models/system --prefill_onnx_dir ../onnx_models/prefill --decode_onnx_dir ../onnx_models/decode --tokenizer_dir D:\qwen_split\qwen3_1.7b --interactive
+python run_local_multiturn.py --prefill_onnx_dir ../onnx_models/prefill --decode_onnx_dir ../onnx_models/decode --tokenizer_dir D:\qwen_split\qwen3_1.7b --interactive
 
 # 批量问题模式
-python run_local_multiturn.py --system_onnx_dir ../onnx_models/system --prefill_onnx_dir ../onnx_models/prefill --decode_onnx_dir ../onnx_models/decode --tokenizer_dir D:\qwen_split\qwen3_1.7b --questions "北京天气怎么样？" "那上海呢？" "温度差多少？"
+python run_local_multiturn.py --prefill_onnx_dir ../onnx_models/prefill --decode_onnx_dir ../onnx_models/decode --tokenizer_dir D:\qwen_split\qwen3_1.7b --questions "北京天气怎么样？" "那上海呢？" "温度差多少？"
 ```
 
 ### 多轮对话流程
 
-每个问题的处理分为两轮推理：
+每个问题的处理分为两轮推理（使用 prefill 模型处理所有输入）：
 
-**第一轮推理**：
-1. 如果有历史记忆，通过 system 模型处理历史对话（用户问题 + 助手回答）
-2. 恢复到基础 KV 状态
-3. Prefill + Decode：用户问题 → 工具调用
+**第一次提问**：
+1. 初始化：prefill 模型处理工具描述 → 生成 base_kv_snapshot
+2. 恢复到 base KV
+3. 第一轮推理：Prefill + Decode → 用户问题 → 工具调用
+4. 保存 question_kv_snapshot
 
-**第二轮推理**（如果有工具调用）：
-1. Reset KV cache
-2. System 模型处理：
-   - 生成第二轮的初始 system KV（工具结果提示）
-   - 如果有历史记忆，追加到 system KV
-3. Prefill + Decode：工具结果 → 最终回答
+**第二次及之后提问**：
+1. 如果有历史记忆：prefill 模型处理（工具描述 + 历史记忆）→ 更新 base_kv_snapshot
+2. 恢复到 base KV
+3. 第一轮推理：Prefill + Decode → 用户问题 → 工具调用
+4. 第二轮推理：prefill 模型处理（工具结果提示 + 历史记忆）→ Prefill + Decode → 最终回答
+5. 存储到对话记忆
 
-### System 模型复用
+### Prefill 模型统一处理
 
-**关键特性**：同一个 system 模型可以处理多种不同的输入：
+**架构特点**：使用 prefill 模型处理所有输入（工具描述、历史记忆、用户问题等）：
 
-1. **初始化阶段**：处理工具描述
+1. **初始化阶段**：prefill 模型处理工具描述
    ```
    你是AI助手，可用工具：
    - get_weather(city*:string) — Get weather information for a city
    ...
    ```
 
-2. **第一轮推理前**：处理历史对话（用户问题 + 助手回答）
+2. **多轮对话中**：prefill 模型处理历史记忆
    ```
+   工具描述...
+   
    ## 历史对话 1
    用户: 北京天气怎么样？
    助手: 根据查询结果，北京今天是晴天...
    ```
 
-3. **第二轮推理前**：处理工具结果提示
+3. **工具结果处理**：prefill 模型处理工具结果提示 + 历史记忆
    ```
    你是一个AI助手。用户问了一个问题，你调用了工具获取了信息。
-   以下是历史对话信息，可以帮助你更好地理解上下文：
+   以下是历史对话信息...
    ```
 
 **优势**：
-- 无需导出多个 system 模型
-- 灵活处理不同的 system prompt
-- 节省模型存储空间
+- 统一使用 prefill 模型，避免 system 模型无 past KV 的限制
+- 灵活的 past KV 机制支持历史记忆追加
+- 简洁的架构设计
 
 ### 详细设计文档
 
@@ -184,4 +187,4 @@ python run_local_multiturn.py --system_onnx_dir ../onnx_models/system --prefill_
 | 工具调用 | 否 | 是 | 是 |
 | 网络通信 | 否 | 是 | 否 |
 | 多轮对话 | 否 | 是 | 是 |
-| System 模型复用 | 否 | 否 | 是 |
+| Prefill 模型统一处理 | 否 | 否 | 是 |

@@ -1,6 +1,6 @@
 """
 单机 ONNX 模型执行 - 支持多轮对话和工具调用
-每次提问都会调用 system 模型处理历史记忆
+使用 prefill 模型处理所有输入（system prompt、历史记忆、用户问题等）
 """
 import argparse
 import json
@@ -17,7 +17,6 @@ from utils import (
     encode_text,
     decode_token_ids,
     decode_incremental_text,
-    build_system_attention_mask,
     build_prefill_with_past_attention_mask,
     build_attention_mask,
     build_position_ids,
@@ -54,14 +53,16 @@ class MultiTurnONNXRunner:
         self.kv_cache = None
         
         # KV cache 快照管理
-        self.base_kv_snapshot = None  # 当前对话状态的基础 KV
-        self.question_kv_snapshot = None  # 当前问题第一轮推理后的 KV
+        self.system_only_kv_snapshot = None       # 仅含第一轮 system prompt 的 KV（永不变）
+        self.base_kv_snapshot = None              # 第一轮：system + 所有历史记忆的 KV
+        self.round2_system_only_kv_snapshot = None  # 仅含第二轮 system prompt 的 KV（永不变）
+        self.round2_base_kv_snapshot = None       # 第二轮：system + 所有历史记忆的 KV
+        self.question_kv_snapshot = None          # 当前问题第一轮推理后的 KV
         
         # 对话记忆
         self.conversation_memory: List[Dict[str, Any]] = []
         
         # 模型运行器（按需加载）
-        self.system_runner = None
         self.prefill_runner = None
         self.decode_runner = None
         self.current_mode = None
@@ -95,8 +96,8 @@ class MultiTurnONNXRunner:
         # 初始化工具系统
         self._init_tools()
         
-        # 生成初始 system KV cache（工具描述）
-        self._init_base_system_kv()
+        # 生成初始 KV cache（工具描述）
+        self._init_base_kv()
         
         print("[MultiTurn] Initialization complete!")
     
@@ -132,9 +133,9 @@ class MultiTurnONNXRunner:
         
         print(f"[MultiTurn] Tool system initialized with {len(self.tool_manager.list_tools())} tools")
     
-    def _init_base_system_kv(self):
-        """生成初始 system KV cache（仅包含工具描述）"""
-        print("[MultiTurn] Generating base system KV cache...")
+    def _init_base_kv(self):
+        """生成初始 KV cache（使用 prefill 模型处理工具描述）"""
+        print("[MultiTurn] Generating base KV cache with prefill model...")
         
         tool_configs = {
             'get_weather': weather_tool.TOOL_CONFIG,
@@ -144,16 +145,28 @@ class MultiTurnONNXRunner:
             'translate': translate_tool.TOOL_CONFIG,
         }
         openai_tools = build_tools_openai_schema(tool_configs)
-        # 初始化时没有历史记忆
-        system_prompt = build_tool_system_prompt(openai_tools, has_history=False)
+        # 始终使用 has_history=True 格式，这样后续追加历史时 system prompt 不变
+        system_prompt = build_tool_system_prompt(openai_tools, has_history=True)
         
-        self._run_system_stage(system_prompt, has_past_kv=False)
+        # 用正确的 chat template 包裹 system prompt
+        full_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        
+        # 使用 prefill 模型处理第一轮 system prompt
+        self._process_prompt_with_prefill(full_prompt)
+        self.system_only_kv_snapshot = self.kv_cache.save_snapshot()
         self.base_kv_snapshot = self.kv_cache.save_snapshot()
         
-        print(f"[MultiTurn] Base system KV generated. past_len={self.past_len}")
+        # 同时初始化第二轮 system prompt 的 KV
+        round2_system_prompt = build_round2_system_prompt(has_history=True)
+        round2_full_prompt = f"<|im_start|>system\n{round2_system_prompt}<|im_end|>\n"
+        self._process_prompt_with_prefill(round2_full_prompt)
+        self.round2_system_only_kv_snapshot = self.kv_cache.save_snapshot()
+        self.round2_base_kv_snapshot = self.kv_cache.save_snapshot()
+        
+        print(f"[MultiTurn] Base KV generated. past_len={self.past_len}")
     
     def _format_memory_text(self) -> str:
-        """将对话记忆格式化为文本（用户问题 + 模型最终回答的JSON格式）"""
+        """将对话记忆格式化为文本"""
         if not self.conversation_memory:
             return ""
         
@@ -166,18 +179,6 @@ class MultiTurnONNXRunner:
         
         return "\n".join(memory_parts)
     
-    def _update_system_kv_with_memory(self, memory_text: str):
-        """使用记忆文本更新 system KV cache"""
-        print(f"[MultiTurn] Updating system KV with memory ({len(memory_text)} chars)...")
-        
-        # 构建包含记忆的 system prompt
-        full_memory_prompt = f"<|im_start|>system\n{memory_text}<|im_end|>\n"
-        
-        self._run_system_stage(full_memory_prompt, has_past_kv=True)
-        self.base_kv_snapshot = self.kv_cache.save_snapshot()
-        
-        print(f"[MultiTurn] System KV updated with memory. past_len={self.past_len}")
-    
     def _ensure_mode(self, mode: str):
         """确保当前加载的模型与所需模式一致"""
         if self.current_mode == mode:
@@ -185,18 +186,13 @@ class MultiTurnONNXRunner:
         
         if self.current_mode:
             print(f"[MultiTurn] Unloading {self.current_mode} models...")
-            if self.current_mode == "system":
-                self.system_runner = None
-            elif self.current_mode == "prefill":
+            if self.current_mode == "prefill":
                 self.prefill_runner = None
             else:
                 self.decode_runner = None
         
         print(f"[MultiTurn] Loading {mode} models...")
-        if mode == "system":
-            paths = self.config.get_system_model_paths()
-            self.system_runner = ONNXModelRunner(paths)
-        elif mode == "prefill":
+        if mode == "prefill":
             paths = self.config.get_prefill_model_paths()
             self.prefill_runner = ONNXModelRunner(paths)
         else:
@@ -208,54 +204,52 @@ class MultiTurnONNXRunner:
     
     def _get_runner(self):
         """获取当前模式的模型运行器"""
-        if self.current_mode == "system":
-            return self.system_runner
-        elif self.current_mode == "prefill":
+        if self.current_mode == "prefill":
             return self.prefill_runner
         else:
             return self.decode_runner
     
-    def _run_system_stage(self, system_prompt_text: str, has_past_kv: bool = False):
+    def _process_prompt_with_prefill(self, prompt_text: str, reset_kv: bool = True):
         """
-        运行 system 阶段生成/更新 KV cache
+        使用 prefill 模型处理 prompt 文本
         
         Args:
-            system_prompt_text: system prompt 文本
-            has_past_kv: 是否有历史 KV cache（True 表示追加模式）
+            prompt_text: 要处理的文本
+            reset_kv: 是否重置 KV cache。False 时在已有 KV 基础上追加
         """
         if self.tokenizer is None:
-            raise RuntimeError("Tokenizer required for system stage")
+            raise RuntimeError("Tokenizer required")
         
-        system_ids = encode_text(self.tokenizer, system_prompt_text)
-        q_len = len(system_ids)
-        system_len = self.config.system_len
+        prompt_ids = encode_text(self.tokenizer, prompt_text)
+        q_len = len(prompt_ids)
+        prefill_len = self.config.prefill_len
         
-        if q_len > system_len:
-            print(f"[MultiTurn] System prompt {q_len} tokens > system_len {system_len}, truncating")
-            system_ids = system_ids[:system_len]
-            q_len = system_len
+        if q_len > prefill_len:
+            print(f"[MultiTurn] Prompt {q_len} tokens > prefill_len {prefill_len}, truncating")
+            prompt_ids = prompt_ids[:prefill_len]
+            q_len = prefill_len
         
-        input_ids = np.array([system_ids], dtype=np.int64)
+        input_ids = np.array([prompt_ids], dtype=np.int64)
         
-        # 加载 system 模型
-        self._ensure_mode("system")
+        # 加载 prefill 模型
+        self._ensure_mode("prefill")
         runner = self._get_runner()
         
         # Embed
-        embed_ids = pad_input_ids(input_ids, system_len, pad_id=0)
+        embed_ids = pad_input_ids(input_ids, prefill_len, pad_id=0)
         hidden = runner.run_embed(embed_ids)
         
-        # Attention mask & position ids
-        if has_past_kv:
-            # 追加模式：使用 prefill 风格的 attention mask
-            attention_mask = build_prefill_with_past_attention_mask(
-                q_len, system_len, self.past_len, self.config.max_cache_len
-            )
+        # 确定起始位置
+        if reset_kv:
+            start_pos = 0
         else:
-            # 初始模式：使用 system attention mask
-            attention_mask = build_system_attention_mask(q_len, system_len)
+            start_pos = self.past_len
         
-        position_ids = build_position_ids(self.past_len, q_len, system_len)
+        # Attention mask & position ids（支持在已有 KV 后追加）
+        attention_mask = build_prefill_with_past_attention_mask(
+            q_len, prefill_len, start_pos, self.config.max_cache_len
+        )
+        position_ids = build_position_ids(start_pos, q_len, prefill_len)
         
         # 运行所有 blocks
         for block_idx in range(4):
@@ -263,44 +257,27 @@ class MultiTurnONNXRunner:
             start_layer = block_idx * num_layers_per_block
             end_layer = start_layer + num_layers_per_block
             
-            if has_past_kv:
-                # 追加模式：需要 past KV
-                past_key = self.kv_cache.past_key[start_layer:end_layer]
-                past_value = self.kv_cache.past_value[start_layer:end_layer]
-                
-                hidden, present_key, present_value = runner.run_block(
-                    block_idx, hidden, attention_mask, position_ids,
-                    past_key, past_value
-                )
-                
-                # 追加到 past_len 位置
-                pk = present_key[:, :, :, :q_len, :].astype(np.float16)
-                pv = present_value[:, :, :, :q_len, :].astype(np.float16)
-                s = self.past_len
-                e = s + q_len
-                self.kv_cache.past_key[start_layer:end_layer, :, :, s:e, :] = pk
-                self.kv_cache.past_value[start_layer:end_layer, :, :, s:e, :] = pv
-            else:
-                # 初始模式：无 past KV
-                hidden, present_key, present_value = runner.run_block(
-                    block_idx, hidden, attention_mask, position_ids
-                )
-                
-                if block_idx == 0:
-                    self.kv_cache.reset()
-                
-                # 直接写入前 q_len 个位置
-                pk = present_key[:, :, :, :q_len, :].astype(np.float16)
-                pv = present_value[:, :, :, :q_len, :].astype(np.float16)
-                self.kv_cache.past_key[start_layer:end_layer, :, :, :q_len, :] = pk
-                self.kv_cache.past_value[start_layer:end_layer, :, :, :q_len, :] = pv
+            # Prefill 模型总是需要 past KV
+            past_key = self.kv_cache.past_key[start_layer:end_layer]
+            past_value = self.kv_cache.past_value[start_layer:end_layer]
+            
+            hidden, present_key, present_value = runner.run_block(
+                block_idx, hidden, attention_mask, position_ids,
+                past_key, past_value
+            )
+            
+            if block_idx == 0 and reset_kv:
+                self.kv_cache.reset()
+            
+            # 写入 KV cache（追加到 start_pos 位置）
+            pk = present_key[:, :, :, :q_len, :].astype(np.float16)
+            pv = present_value[:, :, :, :q_len, :].astype(np.float16)
+            end_pos = start_pos + q_len
+            self.kv_cache.past_key[start_layer:end_layer, :, :, start_pos:end_pos, :] = pk
+            self.kv_cache.past_value[start_layer:end_layer, :, :, start_pos:end_pos, :] = pv
         
-        if has_past_kv:
-            self.kv_cache.current_len = self.past_len + q_len
-            self.past_len = self.past_len + q_len
-        else:
-            self.kv_cache.current_len = q_len
-            self.past_len = q_len
+        self.kv_cache.current_len = start_pos + q_len
+        self.past_len = start_pos + q_len
     
     def process_forward(self, input_ids: np.ndarray, q_len: int, mode: str = "decode"):
         """处理一次前向传播"""
@@ -466,17 +443,21 @@ class MultiTurnONNXRunner:
         print(f"[MultiTurn] Processing question: {user_text}")
         print(f"{'='*60}")
         
-        # 1. 如果有历史记忆，先通过 system 模型处理
-        if self.conversation_memory:
-            memory_text = self._format_memory_text()
-            self._update_system_kv_with_memory(memory_text)
+        # 1. 历史记忆已在上一轮结束时增量追加到 base_kv_snapshot，无需重建
+        # （首轮无历史，base_kv_snapshot == system_only_kv_snapshot）
         
         # 2. 恢复到基础 KV 状态
         self.reset_to_base()
         
         # 3. 第一轮推理：用户问题 → 工具调用
         print(f"\n[MultiTurn] === Round 1: User Question → Tool Calls ===")
-        user_prompt = f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+        # 在用户提问后添加输出格式提示和 /no_think
+        output_format_hint = (
+            '【重要】如需调用工具，必须严格输出JSON格式：{"tool_name":"工具名","arguments":{"参数":"值"}}\n'
+            "禁止使用函数调用格式如 tool(arg:value)。不需要工具则直接用自然语言回答。\n"
+            "/no_think"
+        )
+        user_prompt = f"<|im_start|>user\n{user_text}\n\n{output_format_hint}<|im_end|>\n<|im_start|>assistant\n"
         prompt_ids = encode_text(self.tokenizer, user_prompt)
         prompt_ids = np.array([prompt_ids], dtype=np.int64)
         
@@ -494,26 +475,14 @@ class MultiTurnONNXRunner:
             final_text = decode_token_ids(self.tokenizer, round1_ids, skip_special_tokens=True)
             return final_text
         
-        # 6. 第二轮推理前：通过 system 模型处理历史记忆
-        print(f"\n[MultiTurn] === Round 2 Preparation: Adding History to System ===")
-        
-        # 6.1 生成第二轮的初始 system KV（包含工具结果提示）
-        self.kv_cache.reset()
-        self.past_len = 0
+        # 6. 第二轮推理前：处理工具结果提示
+        print(f"\n[MultiTurn] === Round 2 Preparation: Tool Results ===")
         
         has_history = len(self.conversation_memory) > 0
-        round2_system_prompt = build_round2_system_prompt(has_history=has_history)
-        self._run_system_stage(round2_system_prompt, has_past_kv=False)
-        round2_base_snapshot = self.kv_cache.save_snapshot()
         
-        # 6.2 如果有历史记忆，追加到 system KV
-        if self.conversation_memory:
-            memory_text = self._format_memory_text()
-            full_memory = f"<|im_start|>system\n{memory_text}<|im_end|>\n"
-            self._run_system_stage(full_memory, has_past_kv=True)
-        
-        # 6.3 保存第二轮的 base KV
-        round2_base_snapshot = self.kv_cache.save_snapshot()
+        # 6.1 恢复到第二轮基础 KV（round2_system + 所有历史，已增量维护）
+        self.kv_cache.restore_snapshot(self.round2_base_kv_snapshot)
+        self.past_len = self.round2_base_kv_snapshot['current_len']
         
         # 7. 第二轮推理：工具结果 → 最终回答
         print(f"\n[MultiTurn] === Round 2: Tool Results → Final Answer ===")
@@ -526,7 +495,14 @@ class MultiTurnONNXRunner:
             has_history=has_history,
             tools=None,
         )
-        tool_prompt = build_chat_prompt(system=result_system, user=user_text)
+        # 在工具结果后添加输出格式提示和 /no_think
+        output_format_hint = (
+            '【重要】如需继续调用工具，必须严格输出JSON格式：{"tool_name":"工具名","arguments":{"参数":"值"}}\n'
+            "禁止使用函数调用格式如 tool(arg:value)。否则直接用自然语言回答用户的问题。\n"
+            "/no_think"
+        )
+        # 工具结果作为 user 消息追加（在 round2_base 基础上增量追加）
+        tool_prompt = f"<|im_start|>user\n{result_system}\n{user_text}\n\n{output_format_hint}<|im_end|>\n<|im_start|>assistant\n"
         tool_ids = encode_text(self.tokenizer, tool_prompt)
         
         if len(tool_ids) > self.config.prefill_len:
@@ -548,9 +524,9 @@ class MultiTurnONNXRunner:
             'final_answer': final_text
         })
         
-        # 10. 恢复到问题开始状态，作为下一个问题的基础
-        self.reset_to_question_start()
-        self.base_kv_snapshot = self.question_kv_snapshot
+        # 10. 增量追加最新历史到 base_kv_snapshot
+        #     从 system_only_kv_snapshot 恢复，然后追加所有历史（或从上一个 base 追加最新一条）
+        self._append_latest_history_to_base()
         
         # 11. 返回最终回答
         return final_text
@@ -565,6 +541,34 @@ class MultiTurnONNXRunner:
             self.kv_cache.reset()
             self.past_len = 0
     
+    def _append_latest_history_to_base(self):
+        """
+        增量追加最新一条历史记录到 base_kv_snapshot 和 round2_base_kv_snapshot。
+        """
+        if not self.conversation_memory:
+            return
+        
+        latest = self.conversation_memory[-1]
+        # 格式化为标准 chat template，模型能正确理解这是历史对话
+        new_entry = (
+            f"<|im_start|>user\n{latest['question']}<|im_end|>\n"
+            f"<|im_start|>assistant\n{latest['final_answer']}<|im_end|>\n"
+        )
+        
+        # 更新第一轮 base（从上一个 base 追加）
+        self.kv_cache.restore_snapshot(self.base_kv_snapshot)
+        self.past_len = self.base_kv_snapshot['current_len']
+        self._process_prompt_with_prefill(new_entry, reset_kv=False)
+        self.base_kv_snapshot = self.kv_cache.save_snapshot()
+        
+        # 更新第二轮 base（从上一个 round2_base 追加）
+        self.kv_cache.restore_snapshot(self.round2_base_kv_snapshot)
+        self.past_len = self.round2_base_kv_snapshot['current_len']
+        self._process_prompt_with_prefill(new_entry, reset_kv=False)
+        self.round2_base_kv_snapshot = self.kv_cache.save_snapshot()
+        
+        print(f"[MultiTurn] Base KVs updated with history {len(self.conversation_memory)}. round1_past_len={self.base_kv_snapshot['current_len']}, round2_past_len={self.round2_base_kv_snapshot['current_len']}")
+
     def reset_to_question_start(self):
         """重置到当前问题开始时的 KV 状态"""
         self.step = 0
@@ -582,13 +586,11 @@ class MultiTurnONNXRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-turn ONNX Runner with Tool Support")
-    parser.add_argument("--system_onnx_dir", type=str, required=True, help="System ONNX model directory")
     parser.add_argument("--prefill_onnx_dir", type=str, required=True, help="Prefill ONNX model directory")
     parser.add_argument("--decode_onnx_dir", type=str, required=True, help="Decode ONNX model directory")
     parser.add_argument("--tokenizer_dir", type=str, required=True, help="Tokenizer directory")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--max_cache_len", type=int, default=1024)
-    parser.add_argument("--system_len", type=int, default=256)
     parser.add_argument("--prefill_len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
@@ -600,12 +602,12 @@ def main():
     args = parser.parse_args()
     
     config = LocalConfig(
-        system_onnx_dir=args.system_onnx_dir,
+        system_onnx_dir="",  # 不使用 system 模型
         prefill_onnx_dir=args.prefill_onnx_dir,
         decode_onnx_dir=args.decode_onnx_dir,
         tokenizer_dir=args.tokenizer_dir,
-        system_kv_dir="",  # 不使用持久化的 system KV
-        system_len=args.system_len,
+        system_kv_dir="",
+        system_len=0,  # 不使用 system_len
         prefill_len=args.prefill_len,
         max_cache_len=args.max_cache_len,
         temperature=args.temperature,

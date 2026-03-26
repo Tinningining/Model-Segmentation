@@ -407,6 +407,7 @@ def build_chat_prompt(system: str, user: str) -> str:
 def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
     """
     根据工具列表构建 system prompt（紧凑格式，节省 token）。
+    注意：输出格式提示不包含在此，应在用户提问后添加。
 
     Args:
         tools: OpenAI function calling 格式的工具列表
@@ -438,20 +439,21 @@ def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
 
     tool_list = "\n".join(lines)
     
-    base_prompt = f"你是AI助手，可用工具：\n{tool_list}\n\n"
+    base_prompt = (
+        f"你是AI助手，可用工具：\n{tool_list}\n\n"
+        "调用工具时，必须严格输出以下JSON格式（不得使用函数调用格式）：\n"
+        '{"tool_name":"工具名","arguments":{"参数名":"参数值"}}\n'
+        "每行一个JSON，可同时调用多个工具。不需要工具则直接用自然语言回答。\n"
+        "【重要】需要数学计算时，必须调用 calculator 工具，不要自己计算。\n\n"
+    )
     
     if has_history:
         base_prompt += (
-            "注意：上面提供了历史对话记录。\n"
-            "- 如果用户问题可以直接从历史对话中找到答案，请直接回答，无需调用工具。\n"
-            "- 如果需要新信息或计算，请调用相应工具。\n\n"
+            "【重要】下面提供了历史对话记录，包含之前查询过的信息。\n"
+            "- 如果历史记录中已有相关数据（如天气、时间等），直接使用这些数据，不要重复调用工具。\n"
+            "- 只有当历史记录中没有所需信息时，才调用工具获取新数据。\n"
+            "- 需要数学计算时，必须调用 calculator 工具。\n\n"
         )
-    
-    base_prompt += (
-        f'调用工具时输出JSON：{{"tool_name":"名称","arguments":{{"参数":"值"}}}}\n'
-        f"可一次调用多个，每行一个JSON。不需要工具则直接回答。\n"
-        f"/no_think"
-    )
     
     return base_prompt
 
@@ -459,6 +461,7 @@ def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
 def build_round2_system_prompt(has_history: bool = False) -> str:
     """
     构建第二轮推理的初始 system prompt。
+    注意：输出格式提示不包含在此，应在用户提问后添加。
     
     Args:
         has_history: 是否有历史对话记录
@@ -484,6 +487,7 @@ def build_tool_result_prompt(user_message: str,
                               tools: list = None) -> str:
     """
     构建工具结果注入后的 system prompt（第二轮推理）。
+    注意："/no_think" 不包含在此，应在用户提问后添加。
 
     Args:
         user_message: 原始用户问题
@@ -526,7 +530,6 @@ def build_tool_result_prompt(user_message: str,
     else:
         prompt += f"请基于工具返回的真实数据，用自然语言回答用户的问题。回答要具体、准确、友好。\n"
 
-    prompt += "/no_think"
     return prompt
 
 
