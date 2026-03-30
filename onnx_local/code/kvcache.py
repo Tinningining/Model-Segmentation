@@ -2,6 +2,8 @@
 KV Cache 管理模块 - 单机 ONNX 执行
 """
 import numpy as np
+import os
+from pathlib import Path
 
 
 class KVCache:
@@ -83,3 +85,52 @@ class KVCache:
         self.past_key[:] = snapshot['past_key']
         self.past_value[:] = snapshot['past_value']
         self.current_len = snapshot['current_len']
+    
+    def save_snapshot_to_file(self, filepath: str):
+        """
+        保存 KV cache 快照到文件
+        
+        Args:
+            filepath: 保存路径（不含扩展名）
+        """
+        # 创建目录
+        Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+        
+        # 保存为 .npz 格式
+        np.savez_compressed(
+            filepath + '.npz',
+            past_key=self.past_key,
+            past_value=self.past_value,
+            current_len=np.array([self.current_len])
+        )
+        print(f"[KVCache] Saved snapshot to {filepath}.npz")
+    
+    def load_snapshot_from_file(self, filepath: str) -> bool:
+        """
+        从文件加载 KV cache 快照
+        
+        Args:
+            filepath: 文件路径（不含扩展名）
+        
+        Returns:
+            是否成功加载
+        """
+        npz_path = filepath + '.npz'
+        if not os.path.exists(npz_path):
+            return False
+        
+        try:
+            data = np.load(npz_path)
+            self.past_key[:] = data['past_key']
+            self.past_value[:] = data['past_value']
+            self.current_len = int(data['current_len'][0])
+            print(f"[KVCache] Loaded snapshot from {npz_path}, current_len={self.current_len}")
+            return True
+        except Exception as e:
+            print(f"[KVCache] Failed to load snapshot from {npz_path}: {e}")
+            return False
+    
+    @staticmethod
+    def snapshot_exists(filepath: str) -> bool:
+        """检查快照文件是否存在"""
+        return os.path.exists(filepath + '.npz')

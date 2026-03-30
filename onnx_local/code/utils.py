@@ -404,7 +404,7 @@ def build_chat_prompt(system: str, user: str) -> str:
     )
 
 
-def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
+def build_tool_system_prompt(tools: list, has_history: bool = False, enable_plan_mode: bool = False) -> str:
     """
     根据工具列表构建 system prompt（紧凑格式，节省 token）。
     注意：输出格式提示不包含在此，应在用户提问后添加。
@@ -412,6 +412,7 @@ def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
     Args:
         tools: OpenAI function calling 格式的工具列表
         has_history: 是否有历史对话记录
+        enable_plan_mode: 是否启用执行计划模式（支持并行/串行工具调用）
 
     Returns:
         system prompt 字符串
@@ -439,13 +440,58 @@ def build_tool_system_prompt(tools: list, has_history: bool = False) -> str:
 
     tool_list = "\n".join(lines)
     
-    base_prompt = (
-        f"你是AI助手，可用工具：\n{tool_list}\n\n"
-        "调用工具时，必须严格输出以下JSON格式（不得使用函数调用格式）：\n"
-        '{"tool_name":"工具名","arguments":{"参数名":"参数值"}}\n'
-        "每行一个JSON，可同时调用多个工具。不需要工具则直接用自然语言回答。\n"
-        "【重要】需要数学计算时，必须调用 calculator 工具，不要自己计算。\n\n"
-    )
+    if enable_plan_mode:
+        # 执行计划模式：支持并行/串行工具调用
+        base_prompt = (
+            f"你是AI助手，可用工具：\n{tool_list}\n\n"
+            "【工具调用规则】\n"
+            "1. 分析用户问题，判断需要哪些工具\n"
+            "2. 判断工具间是否有依赖关系：\n"
+            "   - 无依赖：可并行执行\n"
+            "   - 有依赖：必须串行执行，后续工具的参数引用前序工具的结果\n"
+            "3. 输出执行计划（JSON格式）\n\n"
+            "【输出格式】\n\n"
+            "并行模式（工具间无依赖）：\n"
+            '{"mode":"parallel","steps":[{"step_id":1,"parallel_calls":[{"tool_name":"工具名","arguments":{"参数":"值"}}]}]}\n\n'
+            "串行模式（工具间有依赖）：\n"
+            '{"mode":"sequential","steps":[{"step_id":1,"call":{"tool_name":"工具名","arguments":{"参数":"值"}},"output_ref":"$step1_result"},{"step_id":2,"call":{"tool_name":"工具名","arguments":{"参数":"$step1_result.字段"}},"depends_on":[1]}]}\n\n'
+            "混合模式（部分并行，部分串行）：\n"
+            '{"mode":"mixed","steps":[{"step_id":1,"parallel_calls":[{"tool_name":"工具1","arguments":{...},"output_ref":"$ref1"},{"tool_name":"工具2","arguments":{...},"output_ref":"$ref2"}]},{"step_id":2,"call":{"tool_name":"工具3","arguments":{"参数":"$ref1.字段"}},"depends_on":[1]}]}\n\n'
+            "【重要规则】\n"
+            # "- 使用 $stepN_result 或自定义 $ref_name 引用前序结果\n"
+            # "- 使用 .字段名 访问结果的特定字段\n"
+            # "- depends_on 声明依赖的步骤ID列表\n"
+            # "- 不需要工具则直接用自然语言回答\n\n"
+            "- 使用 $stepN_result 或自定义 $ref_name 引用前序结果\n"
+            "- 使用 .字段名 访问结果的特定字段\n"
+            "- depends_on 声明依赖的步骤ID列表\n"
+            "- 需要工具时，只输出 JSON 格式的执行计划，不要输出任何其他文字或答案\n"
+            "- 不需要工具则直接用自然语言回答\n\n"
+            # "- JSON 必须完整，所有左括号 { 和 [ 必须有对应的右括号 } 和 ]，确保 JSON 格式严格正确\n\n"
+
+            # f"你是AI助手，可用工具：\n{tool_list}\n\n"
+            # "【工具调用规则】\n"
+            # "分析问题后输出JSON执行计划。无依赖用parallel，有依赖用sequential。\n\n"
+            # "【输出格式示例】\n"
+            # "并行（同时查多个城市天气）：\n"
+            # '{"mode":"parallel","steps":[{"step_id":1,"parallel_calls":[{"tool_name":"get_weather","arguments":{"city":"北京"}},{"tool_name":"get_weather","arguments":{"city":"上海"}}]}]}\n\n'
+            # "串行（先查天气再计算）：\n"
+            # '{"mode":"sequential","steps":[{"step_id":1,"call":{"tool_name":"get_weather","arguments":{"city":"北京"}},"output_ref":"$r1"},{"step_id":2,"call":{"tool_name":"calculator","arguments":{"expression":"$r1.temperature+10"}},"depends_on":[1]}]}\n\n'
+            # "【规则】\n"
+            # "- $r1引用步骤1结果，$r1.字段访问具体值\n"
+            # "- depends_on声明依赖步骤\n"
+            # "- 需要工具时只输出JSON，不要其他文字\n"
+            # "- 不需要工具则直接回答\n\n"
+        )
+    else:
+        # 传统模式：简单的工具调用
+        base_prompt = (
+            f"你是AI助手，可用工具：\n{tool_list}\n\n"
+            "调用工具时，必须严格输出以下JSON格式（不得使用函数调用格式）：\n"
+            '{"tool_name":"工具名","arguments":{"参数名":"参数值"}}\n'
+            "每行一个JSON，可同时调用多个工具。不需要工具则直接用自然语言回答。\n"
+            "【重要】需要数学计算时，必须调用 calculator 工具，不要自己计算。\n\n"
+        )
     
     if has_history:
         base_prompt += (

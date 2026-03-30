@@ -15,7 +15,7 @@ class LocalConfig:
         decode_onnx_dir: str = "",
         tokenizer_dir: str = "",
         system_kv_dir: str = "./system_kv_cache",
-        system_len: int = 256,
+        system_len: int = 1024,
         prefill_len: int = 512,
         max_cache_len: int = 1024,
         temperature: float = 1.0,

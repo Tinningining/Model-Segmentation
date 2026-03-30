@@ -4,6 +4,7 @@
 """
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -34,6 +35,8 @@ from tools import (
     Device0PreferredScheduler,
     ToolAgent,
     StreamingToolCallParser,
+    ExecutionPlanParser,
+    PlanExecutor,
 )
 from tools.builtin_tools import (
     weather_tool,
@@ -47,10 +50,11 @@ from tools.builtin_tools import (
 class MultiTurnONNXRunner:
     """支持多轮对话的单机 ONNX 模型运行器"""
     
-    def __init__(self, config: LocalConfig):
+    def __init__(self, config: LocalConfig, enable_plan_mode: bool = False):
         self.config = config
         self.tokenizer = None
         self.kv_cache = None
+        self.enable_plan_mode = enable_plan_mode
         
         # KV cache 快照管理
         self.system_only_kv_snapshot = None       # 仅含第一轮 system prompt 的 KV（永不变）
@@ -63,6 +67,7 @@ class MultiTurnONNXRunner:
         self.conversation_memory: List[Dict[str, Any]] = []
         
         # 模型运行器（按需加载）
+        self.system_runner = None  # System 模型运行器
         self.prefill_runner = None
         self.decode_runner = None
         self.current_mode = None
@@ -71,6 +76,10 @@ class MultiTurnONNXRunner:
         self.tool_manager = None
         self.tool_coordinator = None
         self.tool_agent = None
+        
+        # 执行计划系统（仅在 plan_mode 启用时使用）
+        self.plan_parser = None
+        self.plan_executor = None
         
         self.past_len = 0
         self.step = 0
@@ -133,9 +142,101 @@ class MultiTurnONNXRunner:
         
         print(f"[MultiTurn] Tool system initialized with {len(self.tool_manager.list_tools())} tools")
     
+    def _process_prompt_with_system(self, prompt_text: str):
+        """
+        使用 system 模型处理 prompt 文本
+        
+        Args:
+            prompt_text: 要处理的文本（完整的 chat template 格式）
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer required")
+        
+        prompt_ids = encode_text(self.tokenizer, prompt_text)
+        q_len = len(prompt_ids)
+        system_len = self.config.system_len
+        
+        if q_len > system_len:
+            print(f"[MultiTurn] Prompt {q_len} tokens > system_len {system_len}, truncating")
+            prompt_ids = prompt_ids[:system_len]
+            q_len = system_len
+        
+        input_ids = np.array([prompt_ids], dtype=np.int64)
+        
+        # 加载 system 模型
+        if self.system_runner is None:
+            print("[MultiTurn] Loading system models...")
+            paths = self.config.get_system_model_paths()
+            self.system_runner = ONNXModelRunner(paths)
+            print("[MultiTurn] System models loaded")
+        
+        # Embed
+        embed_ids = pad_input_ids(input_ids, system_len, pad_id=0)
+        hidden = self.system_runner.run_embed(embed_ids)
+        
+        # Attention mask & position ids（system 阶段无 past KV）
+        from utils import build_system_attention_mask
+        attention_mask = build_system_attention_mask(q_len, system_len)
+        position_ids = build_position_ids(0, q_len, system_len)
+        
+        # 运行所有 blocks
+        for block_idx in range(4):
+            num_layers_per_block = 7
+            start_layer = block_idx * num_layers_per_block
+            end_layer = start_layer + num_layers_per_block
+            
+            # System 模型不需要 past KV
+            past_key = np.zeros((num_layers_per_block, 1, self.config.num_key_value_heads, 
+                                self.config.max_cache_len, self.config.head_dim), dtype=np.float16)
+            past_value = np.zeros((num_layers_per_block, 1, self.config.num_key_value_heads,
+                                  self.config.max_cache_len, self.config.head_dim), dtype=np.float16)
+            
+            hidden, present_key, present_value = self.system_runner.run_block(
+                block_idx, hidden, attention_mask, position_ids,
+                past_key, past_value
+            )
+            
+            if block_idx == 0:
+                self.kv_cache.reset()
+            
+            # 写入 KV cache
+            pk = present_key[:, :, :, :q_len, :].astype(np.float16)
+            pv = present_value[:, :, :, :q_len, :].astype(np.float16)
+            self.kv_cache.past_key[start_layer:end_layer, :, :, :q_len, :] = pk
+            self.kv_cache.past_value[start_layer:end_layer, :, :, :q_len, :] = pv
+        
+        self.kv_cache.current_len = q_len
+        self.past_len = q_len
+    
     def _init_base_kv(self):
-        """生成初始 KV cache（使用 prefill 模型处理工具描述）"""
-        print("[MultiTurn] Generating base KV cache with prefill model...")
+        """生成初始 KV cache（使用 system 模型处理工具描述，支持文件缓存）"""
+        # 检查是否有缓存文件
+        cache_dir = self.config.system_kv_dir
+        if cache_dir:
+            system_cache_path = os.path.join(cache_dir, "system_only_kv")
+            round2_cache_path = os.path.join(cache_dir, "round2_system_only_kv")
+            
+            # 尝试从缓存加载
+            if KVCache.snapshot_exists(system_cache_path) and KVCache.snapshot_exists(round2_cache_path):
+                print("[MultiTurn] Loading base KV cache from files...")
+                
+                # 加载第一轮 system KV
+                if self.kv_cache.load_snapshot_from_file(system_cache_path):
+                    self.system_only_kv_snapshot = self.kv_cache.save_snapshot()
+                    self.base_kv_snapshot = self.kv_cache.save_snapshot()
+                    
+                    # 加载第二轮 system KV
+                    if self.kv_cache.load_snapshot_from_file(round2_cache_path):
+                        self.round2_system_only_kv_snapshot = self.kv_cache.save_snapshot()
+                        self.round2_base_kv_snapshot = self.kv_cache.save_snapshot()
+                        
+                        print(f"[MultiTurn] Base KV loaded from cache. past_len={self.past_len}")
+                        return
+                
+                print("[MultiTurn] Cache loading failed, regenerating...")
+        
+        # 没有缓存或加载失败，重新生成
+        print("[MultiTurn] Generating base KV cache with system model...")
         
         tool_configs = {
             'get_weather': weather_tool.TOOL_CONFIG,
@@ -151,17 +252,25 @@ class MultiTurnONNXRunner:
         # 用正确的 chat template 包裹 system prompt
         full_prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
         
-        # 使用 prefill 模型处理第一轮 system prompt
-        self._process_prompt_with_prefill(full_prompt)
+        # 使用 system 模型处理第一轮 system prompt
+        self._process_prompt_with_system(full_prompt)
         self.system_only_kv_snapshot = self.kv_cache.save_snapshot()
         self.base_kv_snapshot = self.kv_cache.save_snapshot()
+        
+        # 保存到文件
+        if cache_dir:
+            self.kv_cache.save_snapshot_to_file(os.path.join(cache_dir, "system_only_kv"))
         
         # 同时初始化第二轮 system prompt 的 KV
         round2_system_prompt = build_round2_system_prompt(has_history=True)
         round2_full_prompt = f"<|im_start|>system\n{round2_system_prompt}<|im_end|>\n"
-        self._process_prompt_with_prefill(round2_full_prompt)
+        self._process_prompt_with_system(round2_full_prompt)
         self.round2_system_only_kv_snapshot = self.kv_cache.save_snapshot()
         self.round2_base_kv_snapshot = self.kv_cache.save_snapshot()
+        
+        # 保存到文件
+        if cache_dir:
+            self.kv_cache.save_snapshot_to_file(os.path.join(cache_dir, "round2_system_only_kv"))
         
         print(f"[MultiTurn] Base KV generated. past_len={self.past_len}")
     
@@ -586,11 +695,14 @@ class MultiTurnONNXRunner:
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-turn ONNX Runner with Tool Support")
+    parser.add_argument("--system_onnx_dir", type=str, required=True, help="System ONNX model directory")
     parser.add_argument("--prefill_onnx_dir", type=str, required=True, help="Prefill ONNX model directory")
     parser.add_argument("--decode_onnx_dir", type=str, required=True, help="Decode ONNX model directory")
     parser.add_argument("--tokenizer_dir", type=str, required=True, help="Tokenizer directory")
+    parser.add_argument("--system_kv_dir", type=str, default="./system_kv_cache", help="Directory to cache system KV snapshots")
     parser.add_argument("--max_new_tokens", type=int, default=100)
     parser.add_argument("--max_cache_len", type=int, default=1024)
+    parser.add_argument("--system_len", type=int, default=512, help="System prompt max length")
     parser.add_argument("--prefill_len", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=0)
@@ -602,12 +714,12 @@ def main():
     args = parser.parse_args()
     
     config = LocalConfig(
-        system_onnx_dir="",  # 不使用 system 模型
+        system_onnx_dir=args.system_onnx_dir,
         prefill_onnx_dir=args.prefill_onnx_dir,
         decode_onnx_dir=args.decode_onnx_dir,
         tokenizer_dir=args.tokenizer_dir,
-        system_kv_dir="",
-        system_len=0,  # 不使用 system_len
+        system_kv_dir=args.system_kv_dir,
+        system_len=args.system_len,
         prefill_len=args.prefill_len,
         max_cache_len=args.max_cache_len,
         temperature=args.temperature,
